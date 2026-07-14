@@ -419,6 +419,62 @@ impl ConcreteBaseAudioContext {
         }
     }
 
+    /// Same liveness rule as `wait_for_render_thread`, for protocol steps that
+    /// expect a payload back from the render thread - currently the audio
+    /// graph handed back during a sink change (`CloseAndRecycle`).
+    ///
+    /// `set_sink_id_sync` used a bare `graph_recv.recv().unwrap()`. With the
+    /// render thread stalled (device unplugged, driver dead - cpal only calls
+    /// err_fn and stops issuing callbacks) the graph never arrives and the
+    /// control thread blocks forever; "output device disappeared, application
+    /// switches to another sink" is precisely the sequence that hits this.
+    ///
+    /// Returns `None` when the render thread is deemed gone: zero playhead
+    /// progress across `STALL_GRACE`, or the reply channel disconnected
+    /// without a payload. The context is marked Closed in both cases - the
+    /// graph is unrecoverable at that point, so no later operation could
+    /// succeed anyway.
+    pub(crate) fn recv_from_render_thread<T>(&self, receiver: &Receiver<T>) -> Option<T> {
+        const POLL: Duration = Duration::from_millis(50);
+        const STALL_GRACE: Duration = Duration::from_secs(2);
+
+        let mut last_frames = self.inner.frames_played.load(Ordering::Relaxed);
+        let mut stalled = Duration::ZERO;
+
+        loop {
+            match receiver.recv_timeout(POLL) {
+                Ok(v) => return Some(v),
+                Err(RecvTimeoutError::Disconnected) => {
+                    log::error!(
+                        "Render thread dropped the reply channel without responding - closing \
+                         the AudioContext"
+                    );
+                    self.set_state(AudioContextState::Closed);
+                    return None;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    let frames = self.inner.frames_played.load(Ordering::Relaxed);
+                    if frames != last_frames {
+                        last_frames = frames;
+                        stalled = Duration::ZERO;
+                        continue;
+                    }
+                    stalled += POLL;
+                    if stalled < STALL_GRACE {
+                        continue;
+                    }
+                    log::error!(
+                        "Render thread did not respond within {:?} - assuming the audio device \
+                         is gone, closing the AudioContext",
+                        STALL_GRACE
+                    );
+                    self.set_state(AudioContextState::Closed);
+                    return None;
+                }
+            }
+        }
+    }
+
     pub(crate) fn suspend_control_msgs(&self, msg: ControlMessage) {
         let sender = self.inner.render_channel.read().unwrap();
         *self.inner.suspended_messages.lock().unwrap() = Some(Vec::new());

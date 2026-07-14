@@ -411,7 +411,20 @@ impl AudioContext {
                 // No new audio will be produced because it will receive the shutdown command first.
                 backend_manager_guard.resume()?;
             }
-            graph_recv.recv().unwrap()
+            // Do not block indefinitely: with the render thread stalled (device
+            // unplugged / driver dead) the graph never comes back and a bare
+            // recv() hangs the control thread forever. The liveness wait marks
+            // the context Closed when the render side is deemed gone.
+            match self.base.recv_from_render_thread(&graph_recv) {
+                Some(graph) => graph,
+                None => {
+                    return Err(
+                        "InvalidStateError - the render thread is unresponsive, the AudioContext \
+                         has been closed"
+                            .into(),
+                    );
+                }
+            }
         };
 
         log::debug!("SinkChange: closing audio stream");
