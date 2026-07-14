@@ -301,6 +301,40 @@ impl RenderThread {
         AudioBuffer::from(buffer, sample_rate)
     }
 
+    /// Number of output channels (used by incremental rendering to size its
+    /// buffer; the field is private across modules, hence the accessor).
+    pub(crate) fn output_channels(&self) -> usize {
+        self.number_of_channels
+    }
+
+    /// Incremental offline rendering: renders `n` quanta into `buffer` without
+    /// consuming self, so it can be called repeatedly to continue.
+    /// render_audiobuffer_sync takes `self` and renders everything in one go -
+    /// embedders need to render a segment, hand control back to the control
+    /// side to mutate the graph, and then continue, hence this split.
+    pub fn render_offline_quanta(
+        &mut self,
+        buffer: &mut [Vec<f32>],
+        n: usize,
+        event_loop: &EventLoop,
+    ) {
+        self.handle_control_messages();
+        for _ in 0..n {
+            self.render_offline_quantum(buffer);
+            if event_loop.handle_pending_events() {
+                self.handle_control_messages();
+            }
+        }
+    }
+
+    /// Finalizes an incremental render: runs node destructors and drains
+    /// pending events (mirrors the tail of render_audiobuffer_sync). Consumes
+    /// self - unload_graph already takes `self` by value.
+    pub fn finish_offline_render(self, event_loop: &EventLoop) {
+        self.unload_graph();
+        event_loop.handle_pending_events();
+    }
+
     // Render method of the `OfflineAudioContext::start_rendering`
     //
     // This is the async interface, as compared to render_audiobuffer_sync

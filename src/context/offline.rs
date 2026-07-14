@@ -1,6 +1,6 @@
 //! The `OfflineAudioContext` type
 
-use std::sync::atomic::{AtomicU64, AtomicU8};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::AudioBuffer;
@@ -35,6 +35,33 @@ pub struct OfflineAudioContext {
     renderer: Mutex<Option<OfflineAudioContextRenderer>>,
     /// channel to notify resume actions on the rendering
     resume_sender: mpsc::Sender<()>,
+    /// Incremental rendering state (embedders' drive model; see
+    /// [`Self::render_upto_sync`])
+    incremental: Mutex<Option<IncrementalRender>>,
+    /// Finished incremental render, waiting to be taken by
+    /// [`Self::take_rendered_sync`]
+    rendered: Mutex<Option<AudioBuffer>>,
+    /// Number of frames rendered so far. This must be a lock-free atomic and
+    /// not derived from `incremental`: the early-return paths of
+    /// `render_upto_sync` report the frame count *while holding* the
+    /// `incremental` MutexGuard, and a std Mutex is not re-entrant, so reading
+    /// the count through the mutex from there would self-deadlock the calling
+    /// thread (both sequences are legal: render to the end, take the result,
+    /// call render_upto_sync again; or start_rendering_sync followed by
+    /// render_upto_sync). With an atomic, that deadlock path does not exist by
+    /// construction. It also fixes a semantic wart: after the result has been
+    /// taken, both `incremental` and `rendered` are None and the count would
+    /// otherwise read as 0 instead of `length`.
+    rendered_frames: AtomicUsize,
+}
+
+/// Cross-call state of an incremental offline render.
+struct IncrementalRender {
+    renderer: crate::render::RenderThread,
+    buffer: Vec<Vec<f32>>,
+    /// Number of render quanta produced so far
+    quantum: usize,
+    event_loop: crate::events::EventLoop,
 }
 
 impl std::fmt::Debug for OfflineAudioContext {
@@ -139,6 +166,9 @@ impl OfflineAudioContext {
             length,
             renderer: Mutex::new(Some(renderer)),
             resume_sender,
+            incremental: Mutex::new(None),
+            rendered: Mutex::new(None),
+            rendered_frames: AtomicUsize::new(0),
         }
     }
 
@@ -153,6 +183,130 @@ impl OfflineAudioContext {
     /// # Panics
     ///
     /// Panics if this method is called multiple times
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Incremental offline rendering (for embedders)
+    //
+    // start_rendering_sync renders the whole buffer in one call and consumes
+    // the renderer, and suspend points must all be registered before rendering
+    // starts (suspending after the renderer has been taken panics). Embedders
+    // hosting a JavaScript engine drive rendering incrementally instead:
+    // render up to a suspend point, hand control back to script (which mutates
+    // the graph inside the suspend promise callback), resume, render the next
+    // segment. The three methods below provide that capability; they are
+    // mutually exclusive with suspend/suspend_sync.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Renders up to `upto_frame` (exclusive; rounded up to whole render
+    /// quanta; >= length renders to the end). May be called repeatedly to
+    /// continue. Returns the total number of rendered frames. When the end is
+    /// reached the result is stored and can be taken once through
+    /// [`Self::take_rendered_sync`].
+    ///
+    /// Calling after the render has finished (result stored or already taken)
+    /// or after `start_rendering*` has claimed the renderer is a no-op that
+    /// returns the current frame count. Those early returns run while the
+    /// `incremental` lock is held, which is why the frame count lives in a
+    /// lock-free atomic (see the `rendered_frames` field comment).
+    pub fn render_upto_sync(&mut self, upto_frame: usize) -> usize {
+        let length = self.length;
+        let num_quanta = length.div_ceil(RENDER_QUANTUM_SIZE);
+
+        let mut inc_guard = self.incremental.lock().unwrap();
+        if inc_guard.is_none() {
+            // First call: claim the renderer (mutually exclusive with
+            // start_rendering_sync - both take() it).
+            let Some(r) = self.renderer.lock().unwrap().take() else {
+                // Already finished or claimed by start_rendering* - no-op.
+                // Note: inc_guard is still held here, so only the lock-free
+                // rendered_frames may be read.
+                return self.rendered_frames_sync();
+            };
+            let mut buffer = Vec::with_capacity(r.renderer.output_channels());
+            buffer.resize_with(buffer.capacity(), || Vec::with_capacity(length));
+            *inc_guard = Some(IncrementalRender {
+                renderer: r.renderer,
+                buffer,
+                quantum: 0,
+                event_loop: r.event_loop,
+            });
+        }
+
+        let Some(inc) = inc_guard.as_mut() else {
+            // As above: `incremental` must not be locked again from here.
+            return self.rendered_frames_sync();
+        };
+
+        // A segment is being rendered - Running (the previous segment may have
+        // parked the state at Suspended, see the end of this function).
+        self.base.set_state(AudioContextState::Running);
+
+        let target_q = if upto_frame >= length {
+            num_quanta
+        } else {
+            upto_frame.div_ceil(RENDER_QUANTUM_SIZE).min(num_quanta)
+        };
+        if target_q > inc.quantum {
+            let n = target_q - inc.quantum;
+            let ev = inc.event_loop.clone();
+            inc.renderer.render_offline_quanta(&mut inc.buffer, n, &ev);
+            inc.quantum = target_q;
+        }
+
+        let done = inc.quantum >= num_quanta;
+        let frames = (inc.quantum * RENDER_QUANTUM_SIZE).min(length);
+        self.rendered_frames.store(frames, Ordering::Release);
+
+        if done {
+            // Rendered to the end: finalize and store the result.
+            // finish_offline_render consumes the RenderThread (unload_graph
+            // takes self by value), so the whole IncrementalRender is taken out
+            // and destructured.
+            let owned = inc_guard.take().expect("just checked");
+            drop(inc_guard);
+            let IncrementalRender {
+                renderer,
+                mut buffer,
+                event_loop,
+                ..
+            } = owned;
+            renderer.finish_offline_render(&event_loop);
+            for ch in buffer.iter_mut() {
+                ch.truncate(length); // the last quantum may overshoot `length`
+            }
+            let result = AudioBuffer::from(buffer, self.base.sample_rate());
+            *self.rendered.lock().unwrap() = Some(result.clone());
+            self.base.set_state(AudioContextState::Closed);
+            let _ = self.base.send_event(EventDispatch::complete(result));
+            // Spin the event loop once more after finalizing: the
+            // complete/statechange events are only queued after
+            // finish_offline_render, past the last spin inside it. Without this
+            // extra spin the crate-side oncomplete/onstatechange handlers would
+            // never fire. Matches the tail of start_rendering_sync.
+            event_loop.handle_pending_events();
+        } else {
+            // Parked at a suspend point: per the spec, an OfflineAudioContext
+            // must report "suspended" while parked (leaving it at Running lets
+            // script observe "running" from inside the suspend callback).
+            self.base.set_state(AudioContextState::Suspended);
+        }
+        frames
+    }
+
+    /// Number of frames rendered so far (currentTime = frames / sampleRate).
+    /// Lock-free (see the `rendered_frames` field comment).
+    #[must_use]
+    pub fn rendered_frames_sync(&self) -> usize {
+        self.rendered_frames.load(Ordering::Acquire)
+    }
+
+    /// Takes the finished result after rendering reached the end (None if the
+    /// render is unfinished or the result was already taken).
+    #[must_use]
+    pub fn take_rendered_sync(&mut self) -> Option<AudioBuffer> {
+        self.rendered.lock().unwrap().take()
+    }
+
     #[must_use]
     pub fn start_rendering_sync(&mut self) -> AudioBuffer {
         let renderer = self
@@ -649,5 +803,65 @@ mod tests {
         require_send_sync(context.start_rendering());
         require_send_sync(context.suspend(1.));
         require_send_sync(context.resume());
+    }
+}
+
+#[cfg(test)]
+mod incremental_render_tests {
+    use float_eq::assert_float_eq;
+
+    use super::*;
+    use crate::node::{AudioNode, AudioScheduledSourceNode};
+
+    fn build_graph(context: &mut OfflineAudioContext) {
+        let mut osc = context.create_oscillator();
+        osc.frequency().set_value(440.);
+        osc.connect(&context.destination());
+        osc.start();
+    }
+
+    #[test]
+    fn test_chunked_render_equals_one_shot() {
+        // Rendering in arbitrary increments must produce the exact same samples
+        // as a single start_rendering_sync pass over an identical graph.
+        let length = 1000; // deliberately not a multiple of the quantum size
+
+        let mut reference = OfflineAudioContext::new(1, length, 48000.);
+        build_graph(&mut reference);
+        let expected = reference.start_rendering_sync();
+
+        let mut chunked = OfflineAudioContext::new(1, length, 48000.);
+        build_graph(&mut chunked);
+        assert_eq!(chunked.render_upto_sync(100), 128); // rounded up to quanta
+        assert_eq!(chunked.state(), AudioContextState::Suspended);
+        assert_eq!(chunked.render_upto_sync(600), 640);
+        let frames = chunked.render_upto_sync(usize::MAX);
+        assert_eq!(frames, length);
+        assert_eq!(chunked.state(), AudioContextState::Closed);
+
+        let result = chunked.take_rendered_sync().expect("render finished");
+        assert_float_eq!(
+            result.get_channel_data(0),
+            expected.get_channel_data(0),
+            abs_all <= 0.
+        );
+
+        // The result can only be taken once; afterwards the frame count keeps
+        // reporting the full length and further render calls are no-ops (this
+        // sequence used to self-deadlock when the frame count was derived from
+        // the incremental state under its own mutex).
+        assert!(chunked.take_rendered_sync().is_none());
+        assert_eq!(chunked.render_upto_sync(usize::MAX), length);
+        assert_eq!(chunked.rendered_frames_sync(), length);
+    }
+
+    #[test]
+    fn test_render_upto_after_start_rendering_is_noop() {
+        // start_rendering_sync claims the renderer; a later incremental call
+        // must not panic or deadlock, just report the current frame count.
+        let mut context = OfflineAudioContext::new(1, 256, 48000.);
+        build_graph(&mut context);
+        let _ = context.start_rendering_sync();
+        let _ = context.render_upto_sync(usize::MAX);
     }
 }
