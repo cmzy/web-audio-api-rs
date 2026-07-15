@@ -1639,7 +1639,7 @@ impl AudioParamProcessor {
     ///     a-rate machinery evaluates them at block_time into buffer[0]).
     /// last_event bookkeeping mirrors the corresponding main-loop branches
     /// (subsequent ramps depend on it for their start point).
-    fn krate_catch_up(&mut self, block_time: f64) {
+    fn catch_up_head_events(&mut self, block_time: f64) {
         loop {
             let Some(event) = self.event_timeline.peek() else {
                 return;
@@ -1747,6 +1747,19 @@ impl AudioParamProcessor {
         let is_a_rate = self.automation_rate.is_a_rate();
         let next_block_time = dt.mul_add(count as f64, block_time);
 
+        // Settle queued head events that take effect at or before the first
+        // frame of this block (SetValue/SetValueAtTime at the block boundary,
+        // ramps and curves that already ended). Running this before the
+        // constant-block check lets a block whose only event lands exactly on
+        // its first frame be classified as constant, so the single-valued
+        // optimization below applies and AudioWorkletProcessor.process()
+        // receives a length-1 parameter array as the spec describes (WPT
+        // audioworklet-audioparam-size). For k-rate params this is the same
+        // catch-up that used to run just before the timeline loop (first-frame
+        // semantics); consuming these events here is equivalent for a-rate:
+        // the timeline loop would have applied them on sample 0.
+        self.catch_up_head_events(block_time);
+
         // Check if we can safely return a buffer of length 1 even for a-rate params.
         // Several cases allow us to do so:
         // - The timeline is empty
@@ -1794,7 +1807,7 @@ impl AudioParamProcessor {
         // them onto sample 0.
         //
         // Two steps:
-        //   1. Catch-up (krate_catch_up): apply queued head events whose actual
+        //   1. Catch-up (catch_up_head_events, ran above): apply queued head events whose actual
         //      time is <= block_time to intrinsic_value (root fix for the
         //      first-block problem); strictly later events stay queued.
         //   2. Run the full a-rate machinery and keep only buffer[0] (the
@@ -1810,7 +1823,7 @@ impl AudioParamProcessor {
         let k_first_frame = if is_a_rate {
             0.0 // unused
         } else {
-            self.krate_catch_up(block_time);
+            // catch-up already ran above; intrinsic_value is the first-frame value
             self.intrinsic_value
         };
         let block_infos = BlockInfos {
@@ -2061,7 +2074,7 @@ mod tests {
             let vs = render.compute_intrinsic_values(0., 1., 10);
 
             assert_float_eq!(param.value(), 2., abs_all <= 0.);
-            assert_float_eq!(vs, &[2.; 10][..], abs_all <= 0.);
+            assert_float_eq!(vs, &[2.][..], abs_all <= 0.); // constant block: single-valued
         }
 
         // make sure param.value() is properly clamped
@@ -2085,7 +2098,7 @@ mod tests {
 
             // value should clamped while intrinsic value should not
             assert_float_eq!(param.value(), 1., abs_all <= 0.);
-            assert_float_eq!(vs, &[2.; 10][..], abs_all <= 0.);
+            assert_float_eq!(vs, &[2.][..], abs_all <= 0.); // constant block: single-valued
         }
     }
 
@@ -2297,9 +2310,10 @@ mod tests {
             abs_all <= 0.
         );
 
-        // ramp finishes on first value of this block, i.e. length is 10
+        // ramp finishes on the first value of this block: settled before any
+        // sample is produced, so the block is constant and single-valued
         let vs = render.compute_intrinsic_values(20., 1., 10);
-        assert_float_eq!(vs, &[10.; 10][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[10.][..], abs_all <= 0.); // constant block: single-valued
     }
 
     #[test]
@@ -2339,7 +2353,7 @@ mod tests {
 
         // ramp finished t = 20..30
         let vs = render.compute_intrinsic_values(20., 1., 10);
-        assert_float_eq!(vs, &[20.0; 10][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[20.0][..], abs_all <= 0.); // constant block: single-valued
         assert_float_eq!(param.value(), 20., abs <= 0.);
     }
 
@@ -2425,7 +2439,7 @@ mod tests {
         );
 
         let vs = render.compute_intrinsic_values(10., 1., 10);
-        assert_float_eq!(vs, &[-1.; 10][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[-1.][..], abs_all <= 0.); // constant block: single-valued
 
         // start time should be end time of last event, i.e. 10.
         render.handle_incoming_event(param.linear_ramp_to_value_at_time_raw(1., 30.));
@@ -2471,7 +2485,7 @@ mod tests {
         assert_float_eq!(vs, &res[..], abs_all <= 0.);
 
         let vs = render.compute_intrinsic_values(10., 1., 10);
-        assert_float_eq!(vs, &[1.0; 10][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[1.0][..], abs_all <= 0.); // constant block: single-valued
     }
 
     #[test]
@@ -2694,7 +2708,7 @@ mod tests {
         );
 
         let vs = render.compute_intrinsic_values(10., 1., 10);
-        assert_float_eq!(vs, &[1.; 10][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[1.][..], abs_all <= 0.); // constant block: single-valued
 
         // start time should be end time of last event, i.e. 10.
         render.handle_incoming_event(param.exponential_ramp_to_value_at_time_raw(0.0001, 30.));
@@ -3003,7 +3017,7 @@ mod tests {
             assert_float_eq!(vs, &res[10..20], abs_all <= 1.0e-6);
             // ramp ended
             let vs = render.compute_intrinsic_values(20., 1., 10);
-            assert_float_eq!(vs, &[v1; 10][..], abs_all <= 0.);
+            assert_float_eq!(vs, &[v1][..], abs_all <= 0.); // constant block: single-valued
         }
     }
 
@@ -3080,9 +3094,9 @@ mod tests {
         let vs = render.compute_intrinsic_values(20., 1., 10);
         assert_float_eq!(vs, &res[20..30], abs_all <= 0.);
 
-        // then this block should be [0.; 10]
+        // then this block is constant at 0 (single-valued)
         let vs = render.compute_intrinsic_values(30., 1., 10);
-        assert_float_eq!(vs, &[0.; 10][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[0.][..], abs_all <= 0.); // constant block: single-valued
     }
 
     #[test]
@@ -3189,7 +3203,7 @@ mod tests {
             render.handle_incoming_event(param.cancel_scheduled_values_raw(10.));
 
             let vs = render.compute_intrinsic_values(0., 1., 10);
-            assert_float_eq!(vs, &[0.; 10][..], abs_all <= 0.);
+            assert_float_eq!(vs, &[0.][..], abs_all <= 0.); // constant block: single-valued
         }
 
         // ramp already started, go back to previous value
@@ -3240,7 +3254,7 @@ mod tests {
             render.handle_incoming_event(param.cancel_scheduled_values_raw(10.)); // cancels the ramp
 
             let vs = render.compute_intrinsic_values(0., 1., 10);
-            assert_float_eq!(vs, &[0.; 10][..], abs_all <= 0.);
+            assert_float_eq!(vs, &[0.][..], abs_all <= 0.); // constant block: single-valued
         }
 
         {
@@ -3535,7 +3549,7 @@ mod tests {
         );
 
         let vs = render.compute_intrinsic_values(10., 1., 10);
-        assert_float_eq!(vs, &[0.; 10][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[0.][..], abs_all <= 0.); // constant block: single-valued
     }
 
     #[test]
@@ -3570,7 +3584,7 @@ mod tests {
         );
 
         let vs = render.compute_intrinsic_values(20., 1., 10);
-        assert_float_eq!(vs, &[0.; 10][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[0.][..], abs_all <= 0.); // constant block: single-valued
     }
 
     #[test]
@@ -4044,7 +4058,7 @@ mod cancel_and_hold_regression_tests {
         render.handle_incoming_event(param.cancel_and_hold_at_time_raw(5.));
 
         let vs = render.compute_intrinsic_values(0., 1., 10);
-        assert_float_eq!(vs, &[1.; 10][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[1.][..], abs_all <= 0.); // constant block: single-valued
     }
 
     #[test]
@@ -4071,5 +4085,44 @@ mod cancel_and_hold_regression_tests {
             vs[9] > 1.,
             "the truncated setTarget must survive the second cancel"
         );
+    }
+
+    #[test]
+    fn test_arate_boundary_event_yields_constant_block() {
+        // An event that lands exactly on the first frame of a block settles
+        // before any sample of that block is produced; if nothing else is
+        // scheduled inside the block, the block is constant. The spec's
+        // single-valued optimization then applies and
+        // AudioWorkletProcessor.process() must receive a length-1 parameter
+        // array (WPT audioworklet-audioparam-size checks the array sizes).
+        let context = OfflineAudioContext::new(1, 1, 48000.);
+        let opts = AudioParamDescriptor {
+            name: String::new(),
+            automation_rate: AutomationRate::A,
+            default_value: 0.,
+            min_value: -10.,
+            max_value: 10.,
+        };
+        let (param, mut render) = audio_param_pair(opts, context.mock_registration());
+        render.handle_incoming_event(param.set_value_at_time_raw(1., 128.));
+        render.handle_incoming_event(param.set_value_at_time_raw(2., 256.));
+
+        {
+            let b0 = render.compute_intrinsic_values(0., 1., 128);
+            assert_eq!(b0.len(), 1); // nothing scheduled inside block 0
+            assert_float_eq!(b0[0], 0., abs <= 0.);
+        }
+        {
+            // the t=128 event applies on this block's first frame; the next
+            // event starts the following block: constant, single-valued
+            let b1 = render.compute_intrinsic_values(128., 1., 128);
+            assert_eq!(b1.len(), 1);
+            assert_float_eq!(b1[0], 1., abs <= 0.);
+        }
+        {
+            let b2 = render.compute_intrinsic_values(256., 1., 128);
+            assert_eq!(b2.len(), 1);
+            assert_float_eq!(b2[0], 2., abs <= 0.);
+        }
     }
 }
