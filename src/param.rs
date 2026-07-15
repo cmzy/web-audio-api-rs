@@ -1218,9 +1218,22 @@ impl AudioParamProcessor {
 
         if infos.is_a_rate {
             let start_index = self.buffer.len();
-            // TODO use ceil() or round() when `end_time` is between two samples?
-            // <https://github.com/orottier/web-audio-api-rs/pull/460>
-            let end_index = ((end_time - infos.block_time).max(0.) / infos.dt).round() as usize;
+            let mut end_index = ((end_time - infos.block_time).max(0.) / infos.dt).round() as usize;
+            // Sub-sample ramp (0 < duration < dt/2): round() collapses it to zero samples in this
+            // block, and the fall-through below would then write end_value into the sample at
+            // start_index. If that sample is still on the ramp (its time <= end_time) it must instead
+            // take the ramp value (which at t == start_time is the start value), not the end value.
+            // The `duration > 0` guard is essential: zero-duration ramps (multiple ramps scheduled at
+            // the SAME time, event-insertion's junction ramps) must NOT be bumped -- they legitimately
+            // collapse to end_value, and compute_linear_ramp_sample would divide by a zero duration.
+            // (audioparam-close: frame 0 at t == start_time must equal the previous event's value.)
+            if end_index == start_index
+                && duration > 0.
+                && start_index < infos.count
+                && (start_index as f64).mul_add(infos.dt, infos.block_time) <= end_time
+            {
+                end_index = start_index + 1;
+            }
             let end_index_clipped = end_index.min(infos.count);
 
             // compute "real" value according to `t` then clamp it
