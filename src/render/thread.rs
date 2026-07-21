@@ -345,6 +345,7 @@ impl RenderThread {
         length: usize,
         mut suspend_callbacks: Vec<(usize, oneshot::Sender<()>)>,
         mut resume_receiver: mpsc::Receiver<()>,
+        mut suspend_injection: mpsc::UnboundedReceiver<(usize, oneshot::Sender<()>)>,
         event_loop: &EventLoop,
     ) -> AudioBuffer {
         let sample_rate = self.sample_rate;
@@ -359,6 +360,15 @@ impl RenderThread {
         self.handle_control_messages();
 
         for quantum in 0..num_frames {
+            // Merge any suspend points scheduled after rendering started (e.g. from
+            // inside a previous suspend point's callback) into the pending list.
+            while let Ok((q, sender)) = suspend_injection.try_recv() {
+                let pos = suspend_callbacks
+                    .binary_search_by_key(&q, |&(qq, _)| qq)
+                    .unwrap_or_else(|e| e);
+                suspend_callbacks.insert(pos, (q, sender));
+            }
+
             // Suspend at given times and run callbacks
             if suspend_callbacks.first().map(|&(q, _)| q) == Some(quantum) {
                 let sender = suspend_callbacks.remove(0).1;

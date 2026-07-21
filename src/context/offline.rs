@@ -35,6 +35,9 @@ pub struct OfflineAudioContext {
     renderer: Mutex<Option<OfflineAudioContextRenderer>>,
     /// channel to notify resume actions on the rendering
     resume_sender: mpsc::Sender<()>,
+    /// channel to inject `suspend` points scheduled after rendering has started
+    /// (see the matching `suspend_injection_receiver` on the renderer)
+    suspend_injection_sender: mpsc::UnboundedSender<(usize, oneshot::Sender<()>)>,
     /// Incremental rendering state (embedders' drive model; see
     /// [`Self::render_upto_sync`])
     incremental: Mutex<Option<IncrementalRender>>,
@@ -82,6 +85,10 @@ struct OfflineAudioContextRenderer {
     suspend_callbacks: Vec<(usize, Box<OfflineAudioContextCallback>)>,
     /// channel to listen for `resume` calls on a suspended context
     resume_receiver: mpsc::Receiver<()>,
+    /// channel for `suspend` points registered *after* rendering has started
+    /// (e.g. scheduled from inside a suspend promise callback); drained by the
+    /// render loop and merged into the pending suspend list
+    suspend_injection_receiver: mpsc::UnboundedReceiver<(usize, oneshot::Sender<()>)>,
     /// event loop to run after each render quantum
     event_loop: EventLoop,
 }
@@ -152,12 +159,14 @@ impl OfflineAudioContext {
         );
 
         let (resume_sender, resume_receiver) = mpsc::channel(0);
+        let (suspend_injection_sender, suspend_injection_receiver) = mpsc::unbounded();
 
         let renderer = OfflineAudioContextRenderer {
             renderer,
             suspend_promises: Vec::new(),
             suspend_callbacks: Vec::new(),
             resume_receiver,
+            suspend_injection_receiver,
             event_loop,
         };
 
@@ -166,6 +175,7 @@ impl OfflineAudioContext {
             length,
             renderer: Mutex::new(Some(renderer)),
             resume_sender,
+            suspend_injection_sender,
             incremental: Mutex::new(None),
             rendered: Mutex::new(None),
             rendered_frames: AtomicUsize::new(0),
@@ -362,6 +372,7 @@ impl OfflineAudioContext {
             renderer,
             suspend_promises,
             resume_receiver,
+            suspend_injection_receiver,
             event_loop,
             ..
         } = renderer;
@@ -369,7 +380,13 @@ impl OfflineAudioContext {
         self.base.set_state(AudioContextState::Running);
 
         let result = renderer
-            .render_audiobuffer(self.length, suspend_promises, resume_receiver, &event_loop)
+            .render_audiobuffer(
+                self.length,
+                suspend_promises,
+                resume_receiver,
+                suspend_injection_receiver,
+                &event_loop,
+            )
             .await;
 
         self.base.set_state(AudioContextState::Closed);
@@ -409,9 +426,14 @@ impl OfflineAudioContext {
     ///
     /// The specified time is quantized and rounded up to the render quantum size.
     ///
+    /// Suspend points may be scheduled before rendering starts *or dynamically
+    /// after it has started* - e.g. from inside a previous suspend point's
+    /// promise callback, which is how the standard suspend/resume contract is
+    /// meant to be driven (the suspend times are generally not known up front).
+    ///
     /// # Panics
     ///
-    /// Panics if the quantized frame number
+    /// Panics (synchronously, when this method is called) if the quantized frame number
     ///
     /// - is negative or
     /// - is less than or equal to the current time or
@@ -445,32 +467,52 @@ impl OfflineAudioContext {
     /// assert_eq!(buffer.number_of_channels(), 1);
     /// assert_eq!(buffer.length(), 512);
     /// ```
-    pub async fn suspend(&self, suspend_time: f64) {
+    pub fn suspend(&self, suspend_time: f64) -> impl std::future::Future<Output = ()> + '_ {
         let quantum = self.calculate_suspend_frame(suspend_time);
 
         let (sender, receiver) = oneshot::channel();
 
-        // We are mixing async with a std Mutex, so be sure not to `await` while the lock is held
+        // Register the suspend point synchronously (before returning the future),
+        // so that a point scheduled right before `resume()` - the standard driving
+        // pattern - is guaranteed to be in place before the render loop advances
+        // past it. Only waiting for the point to be reached is deferred to the
+        // returned future.
         {
             let mut lock = self.renderer.lock().unwrap();
-            let renderer = lock
-                .as_mut()
-                .expect("InvalidStateError - cannot suspend when rendering has already started");
+            match lock.as_mut() {
+                // Rendering has not started yet: register the suspend point on
+                // the renderer directly, as before.
+                Some(renderer) => {
+                    let insert_pos = renderer
+                        .suspend_promises
+                        .binary_search_by_key(&quantum, |&(q, _)| q)
+                        .expect_err(
+                            "InvalidStateError - cannot suspend multiple times at the same render quantum",
+                        );
 
-            let insert_pos = renderer
-                .suspend_promises
-                .binary_search_by_key(&quantum, |&(q, _)| q)
-                .expect_err(
-                    "InvalidStateError - cannot suspend multiple times at the same render quantum",
-                );
-
-            renderer
-                .suspend_promises
-                .insert(insert_pos, (quantum, sender));
+                    renderer
+                        .suspend_promises
+                        .insert(insert_pos, (quantum, sender));
+                }
+                // Rendering is already underway (the renderer has been moved into
+                // `render_audiobuffer`, typically because we are being called from
+                // inside a suspend promise callback). Inject the new suspend point
+                // into the running render loop instead of panicking. The render
+                // loop drains this channel and merges the point into its pending
+                // list, so suspend points can be scheduled dynamically - which is
+                // what the standard suspend/resume contract requires.
+                None => {
+                    self.suspend_injection_sender
+                        .unbounded_send((quantum, sender))
+                        .expect("InvalidStateError - cannot suspend, rendering has finished");
+                }
+            }
         } // lock is dropped
 
-        receiver.await.unwrap();
-        self.base().set_state(AudioContextState::Suspended);
+        async move {
+            receiver.await.unwrap();
+            self.base().set_state(AudioContextState::Suspended);
+        }
     }
 
     /// Schedules a suspension of the time progression in the audio context at the specified time
@@ -699,6 +741,61 @@ mod tests {
     }
 
     #[test]
+    fn render_dynamic_suspend_after_start_async() {
+        // The standard suspend/resume driving pattern schedules each suspend
+        // point from inside the previous point's promise callback - i.e. the
+        // suspend times are not known up front and later ones are scheduled
+        // *after* `start_rendering()` has begun. Before dynamic suspend
+        // injection, `suspend()` panicked in that case ("cannot suspend when
+        // rendering has already started"). This mirrors that pattern and checks
+        // the dynamically scheduled points take effect at the right frames.
+        use futures::executor;
+        use futures::join;
+
+        let sample_rate = 48_000.0_f32;
+        let quantum = RENDER_QUANTUM_SIZE as f64; // suspend(k * quantum / sr) lands on quantum k
+        let length = RENDER_QUANTUM_SIZE * 5; // 5 quanta
+        let context = Arc::new(OfflineAudioContext::new(1, length, sample_rate));
+
+        let mut src = context.create_constant_source();
+        src.offset().set_value(1.0);
+        src.connect(&context.destination());
+        src.start();
+
+        let ctx = Arc::clone(&context);
+        let suspend_time = |k: u32| k as f64 * quantum / sample_rate as f64;
+        let driver = async move {
+            // suspend(1) is registered before rendering starts; the remaining
+            // points are scheduled from *inside* the previous point's handler,
+            // i.e. after `start_rendering` has claimed the renderer. Each next
+            // point is scheduled *before* the matching resume - mirroring the
+            // standard `suspend(t).then(|| { schedule_next(); resume(); })`
+            // driving pattern - so it is registered while the render is parked.
+            let mut current = Some(ctx.suspend(suspend_time(1)));
+            for k in 1..5u32 {
+                current.take().unwrap().await;
+                // mutate the graph at the suspend point: the next segment carries k+1
+                src.offset().set_value((k + 1) as f32);
+                if k + 1 < 5 {
+                    // dynamic: registered now (render is parked), before resume
+                    current = Some(ctx.suspend(suspend_time(k + 1)));
+                }
+                ctx.resume().await;
+            }
+        };
+
+        let render = context.start_rendering();
+        let buffer = executor::block_on(async move { join!(driver, render).1 });
+
+        assert_eq!(buffer.length(), length);
+        let ch = buffer.get_channel_data(0);
+        // segment [k, k+1) carries value k+1: q0 = 1 (initial), q1 = 2, ... q4 = 5
+        for k in 0..5usize {
+            assert_float_eq!(ch[k * RENDER_QUANTUM_SIZE + 10], (k + 1) as f32, abs <= 1e-6);
+        }
+    }
+
+    #[test]
     #[should_panic]
     fn test_suspend_negative_panics() {
         let mut context = OfflineAudioContext::new(2, 128, 44_100.);
@@ -801,7 +898,8 @@ mod tests {
         let context = OfflineAudioContext::new(2, 555, 44_100.);
 
         require_send_sync(context.start_rendering());
-        require_send_sync(context.suspend(1.));
+        // suspend now registers synchronously, so the time must be valid on call
+        require_send_sync(context.suspend(0.));
         require_send_sync(context.resume());
     }
 }
