@@ -121,6 +121,11 @@ struct DestinationRenderer {
 }
 
 impl AudioProcessor for DestinationRenderer {
+    /// 把每个 quantum 送进 MediaStream；漏调 = 下游收到的流出现空洞。
+    fn always_active(&self) -> bool {
+        true
+    }
+
     fn process(
         &mut self,
         inputs: &[AudioRenderQuantum],

@@ -730,6 +730,10 @@ pub(crate) struct AudioParamProcessor {
 }
 
 impl AudioProcessor for AudioParamProcessor {
+    fn is_audio_param(&self) -> bool {
+        true
+    }
+
     fn process(
         &mut self,
         inputs: &[AudioRenderQuantum],

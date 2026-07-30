@@ -188,6 +188,11 @@ struct ScriptProcessorRenderer {
 unsafe impl Send for ScriptProcessorRenderer {}
 
 impl AudioProcessor for ScriptProcessorRenderer {
+    /// onaudioprocess 必须按 bufferSize 节奏回调，这是它的全部契约——静音输入也要回调。
+    fn always_active(&self) -> bool {
+        true
+    }
+
     fn process(
         &mut self,
         inputs: &[AudioRenderQuantum],

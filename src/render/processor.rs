@@ -174,6 +174,38 @@ pub trait AudioProcessor: Send {
         false
     }
 
+    /// Indicates this processor must be polled every render quantum, even when it can not possibly
+    /// emit sound.
+    ///
+    /// The render graph skips `process` for nodes that are provably silent this quantum (no active
+    /// upstream, not producing themselves - see `Graph::render`). That is safe for pure DSP nodes,
+    /// but wrong for processors whose *being called* is part of their contract:
+    /// - they observe the signal even when it is silent (AnalyserNode must keep filling its FIFO,
+    ///   otherwise `getFloatTimeDomainData` returns stale data),
+    /// - they drive IO or message passing (destination, media stream destination, worklet/script
+    ///   processor callbacks must fire on every quantum),
+    /// - they are fed from outside the graph and have no incoming edges to be activated by
+    ///   (media element / media stream sources).
+    ///
+    /// Defaults to `false`. When in doubt, return `true`: the cost is one `process` call per
+    /// quantum, whereas a wrong `false` silently breaks the node.
+    fn always_active(&self) -> bool {
+        false
+    }
+
+    /// Whether this is the renderer of an `AudioParam`.
+    ///
+    /// Parameters are the one processor kind that cannot be judged by its own return value: their
+    /// `process` unconditionally recomputes the automation timeline and always claims tail time, so
+    /// the activity check in `Graph::render` follows the host node they feed instead. A parameter
+    /// with no host left (its node was already reclaimed) has nobody to read it and goes dormant.
+    ///
+    /// This must be declared rather than inferred from the hidden `usize::MAX` edge: that edge is
+    /// removed when the host is dropped, which is exactly the case we need to detect.
+    fn is_audio_param(&self) -> bool {
+        false
+    }
+
     fn before_drop(&mut self, _scope: &AudioWorkletGlobalScope) {}
 }
 

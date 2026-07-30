@@ -62,6 +62,18 @@ pub struct Node {
     has_inputs_connected: bool,
     /// Indicates if the node can act as a cycle breaker (only DelayNode for now)
     cycle_breaker: bool,
+    /// Activity tracking - see the activity propagation block in [`Graph::render`].
+    ///
+    /// Whether `process` reported tail time last quantum (i.e. the node was, or still might be,
+    /// producing sound on its own). Starts as `true` so a fresh node always runs at least once.
+    was_producing: bool,
+    /// Whether an active upstream pushed a signal into us this quantum. Set by upstream nodes while
+    /// they distribute their outputs, cleared each quantum alongside `has_inputs_connected`.
+    upstream_active: bool,
+    /// Last quantum's final activity verdict. Read by AudioParam nodes to follow their host: the
+    /// topological order visits a param *before* its host, so the host's verdict is only available
+    /// with a one-quantum lag (which can only make a param run one quantum too long, never too few).
+    active_prev: bool,
 }
 
 impl std::fmt::Debug for Node {
@@ -259,6 +271,9 @@ impl Graph {
                 control_handle_dropped: false,
                 has_inputs_connected: false,
                 cycle_breaker: false,
+                was_producing: true, // a fresh node always runs at least once
+                upstream_active: false,
+                active_prev: true,
             }),
         );
 
@@ -321,7 +336,13 @@ impl Graph {
     }
 
     pub fn route_message(&mut self, index: AudioNodeId, msg: &mut dyn Any) {
-        self.nodes.get_unchecked_mut(index).processor.onmessage(msg);
+        let node = self.nodes.get_unchecked_mut(index);
+        node.processor.onmessage(msg);
+        // Any control-side message can turn a dormant node back into a producer - most importantly
+        // `start()` on a source that was never scheduled, which reports no tail time (#462) and
+        // would otherwise stay skipped by the activity check in `render` forever after. Re-arm it;
+        // one wasted quantum is the entire cost of being safe here.
+        node.was_producing = true;
     }
 
     /// Helper function for `order_nodes` - traverse node and outgoing edges
@@ -502,10 +523,54 @@ impl Graph {
             // acquire a mutable borrow of the current processing node
             let mut node = self.nodes.get_unchecked(*index).borrow_mut();
 
+            // ── Activity: skip nodes that provably cannot emit sound this quantum ──
+            //
+            // This graph is push-based: without this check *every* node in `ordered` is processed
+            // every quantum, forever - including nodes that finished playing long ago and linger
+            // only because the control thread has not dropped their handle yet (for a JS binding
+            // that means "until the garbage collector gets round to it"). Browsers do not pay that:
+            // Blink renders pull-based from the destination, so a subgraph with no live source is
+            // simply never visited. This block is the push-side equivalent.
+            //
+            // A node is active when it produces on its own (`was_producing`, i.e. it reported tail
+            // time last quantum - covers scheduled sources before and during playback, plus any
+            // tail ringing out), when an active upstream pushed a signal into it this quantum, or
+            // when it must be polled regardless (`always_active`).
+            //
+            // AudioParam nodes are the case that matters most: their `process` unconditionally
+            // recomputes the automation timeline and never reports "nothing to do", so a graph full
+            // of finished notes keeps evaluating hundreds of parameter curves per quantum. They
+            // follow their host instead - a parameter whose host does not run has nobody to read it.
+            let active = if node.processor.is_audio_param() {
+                // Follow the host node(s) this parameter feeds. No host edge left means the host was
+                // already reclaimed and nobody can read this parameter any more - go dormant. (Do not
+                // infer param-ness from the presence of that edge: it is dropped together with the
+                // host, which would leave orphaned params looking like ordinary nodes that always
+                // claim tail time, i.e. permanently active - the exact leak this guards against.)
+                node.outgoing_edges
+                    .iter()
+                    .filter(|edge| edge.other_index == usize::MAX)
+                    .any(|edge| {
+                        // A host mid-teardown counts as active: never skip on a stale edge.
+                        !self.nodes.contains(edge.other_id)
+                            || self.nodes.get_unchecked(edge.other_id).borrow().active_prev
+                    })
+            } else {
+                node.processor.always_active() || node.was_producing || node.upstream_active
+            };
+
             // let the current node process (catch any panics that may occur)
             let params = AudioParamValues::from(&self.nodes);
             scope.node_id.set(*index);
-            let (success, tail_time) = {
+            let (success, tail_time) = if !active {
+                // Outputs stay silent. `process` implementations do silence their outputs on the
+                // quantum they stop producing, but do not rely on it - a stale buffer here would be
+                // an audible glitch, and silencing is just a flag flip.
+                node.outputs
+                    .iter_mut()
+                    .for_each(AudioRenderQuantum::make_silent);
+                (true, false)
+            } else {
                 // We are abusing AssertUnwindSafe here, we cannot guarantee it upholds.
                 // This may lead to logic bugs later on, but it is the best that we can do.
                 // The alternative is to crash and reboot the render thread.
@@ -520,6 +585,8 @@ impl Graph {
                     }
                 }
             };
+            node.was_producing = tail_time;
+            node.active_prev = active;
 
             // iterate all outgoing edges, lookup these nodes and add to their input
             node.outgoing_edges
@@ -529,6 +596,9 @@ impl Graph {
                 .for_each(|edge| {
                     let mut output_node = self.nodes.get_unchecked(edge.other_id).borrow_mut();
                     output_node.has_inputs_connected = true;
+                    // Only a node that actually ran may wake its downstream; propagating from a
+                    // skipped node would keep the whole tail of the graph alive forever.
+                    output_node.upstream_active |= active;
                     let signal = &node.outputs[edge.self_index];
                     let channel_config = &output_node.channel_config.clone();
 
@@ -546,6 +616,7 @@ impl Graph {
 
                 // Reset input state
                 node.has_inputs_connected = false;
+                node.upstream_active = false;
             }
 
             drop(node); // release borrow of self.nodes
@@ -958,6 +1029,164 @@ mod tests {
 
         // No other dropped nodes
         assert!(node_id_consumer.pop().is_none());
+    }
+
+    /// Counts how often it was polled, so tests can assert the graph *skipped* it.
+    #[derive(Debug, Default)]
+    struct CountingNode {
+        tail_time: bool,
+        /// Mimic an AudioParam renderer (always claims tail time, judged by its host instead).
+        is_param: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AudioProcessor for CountingNode {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.tail_time
+        }
+
+        fn is_audio_param(&self) -> bool {
+            self.is_param
+        }
+    }
+
+    fn test_scope() -> AudioWorkletGlobalScope {
+        AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            event_sender: crossbeam_channel::unbounded().0,
+            node_id: std::cell::Cell::new(AudioNodeId(0)),
+        }
+    }
+
+    /// Nodes that can no longer emit sound must stop being polled.
+    ///
+    /// This is what ties render cost to what is *audible* rather than to what is still allocated.
+    /// A JS binding cannot drop a node's handle until its wrapper is garbage collected, so a page
+    /// doing fire-and-forget notes (`osc.start(); osc.stop()`, the idiomatic pattern) accumulates
+    /// hundreds of finished nodes between collections. Without activity propagation every one of
+    /// them - and every one of their AudioParams, whose `process` never reports "nothing to do" -
+    /// was fully evaluated on every single quantum.
+    #[test]
+    fn test_inactive_nodes_are_skipped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        let scope = test_scope();
+
+        add_node(
+            &mut graph,
+            DESTINATION_NODE_ID.0,
+            Box::new(TestNode { tail_time: true }),
+        );
+
+        // A source that produces for exactly one quantum feeding a gain-like node, which in turn
+        // has an AudioParam attached - the shape every synthesised note has.
+        let source_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let effect_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let param_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        add_node(
+            &mut graph,
+            1,
+            Box::new(CountingNode {
+                tail_time: false, // finished right away
+                is_param: false,
+                calls: source_calls.clone(),
+            }),
+        );
+        add_node(
+            &mut graph,
+            2,
+            Box::new(CountingNode {
+                tail_time: false,
+                is_param: false,
+                calls: effect_calls.clone(),
+            }),
+        );
+        add_node(
+            &mut graph,
+            3,
+            Box::new(CountingNode {
+                tail_time: true, // AudioParams always claim tail time ...
+                is_param: true,  // ... so they are judged by their host instead
+                calls: param_calls.clone(),
+            }),
+        );
+        add_edge(&mut graph, 1, 2);
+        add_edge(&mut graph, 2, DESTINATION_NODE_ID.0);
+        add_audioparam(&mut graph, 3, 2);
+
+        for _ in 0..10 {
+            graph.render(&scope);
+        }
+
+        // Each runs once (a fresh node always gets one quantum) and then goes quiet; the param is
+        // allowed one extra, since it observes its host's verdict with a one-quantum lag.
+        assert!(
+            source_calls.load(Ordering::Relaxed) <= 2,
+            "finished source kept being polled: {} times in 10 quanta",
+            source_calls.load(Ordering::Relaxed)
+        );
+        assert!(
+            effect_calls.load(Ordering::Relaxed) <= 2,
+            "node with no active input kept being polled: {} times in 10 quanta",
+            effect_calls.load(Ordering::Relaxed)
+        );
+        assert!(
+            param_calls.load(Ordering::Relaxed) <= 3,
+            "AudioParam of a dormant host kept being polled: {} times in 10 quanta",
+            param_calls.load(Ordering::Relaxed)
+        );
+    }
+
+    /// ... but a source that is merely *scheduled* must not stay skipped: `start()` arrives as a
+    /// control message and the node has no incoming edge that could wake it.
+    #[test]
+    fn test_control_message_reactivates_node() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        let scope = test_scope();
+        add_node(
+            &mut graph,
+            DESTINATION_NODE_ID.0,
+            Box::new(TestNode { tail_time: true }),
+        );
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        add_node(
+            &mut graph,
+            1,
+            Box::new(CountingNode {
+                tail_time: false,
+                is_param: false,
+                calls: calls.clone(),
+            }),
+        );
+        add_edge(&mut graph, 1, DESTINATION_NODE_ID.0);
+
+        for _ in 0..5 {
+            graph.render(&scope);
+        }
+        let before = calls.load(Ordering::Relaxed);
+
+        // Simulate `start()` being routed to the renderer.
+        let mut msg = ();
+        graph.route_message(AudioNodeId(1), &mut msg);
+        graph.render(&scope);
+
+        assert!(
+            calls.load(Ordering::Relaxed) > before,
+            "node stayed dormant after receiving a control message"
+        );
     }
 }
 

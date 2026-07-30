@@ -461,6 +461,12 @@ impl<P: AudioWorkletProcessor> AudioProcessor for AudioWorkletRenderer<P> {
     fn has_side_effects(&self) -> bool {
         true // could be IO, message passing, ..
     }
+
+    /// AudioWorkletProcessor 的 process 必须每 quantum 调用（用户代码可能只靠被调用来推进状态
+    /// 或发消息），且它可以在没有输入的情况下自行产声。
+    fn always_active(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -73,6 +73,14 @@ impl<R> MediaStreamRenderer<R> {
 }
 
 impl<R: AudioBufferIter> AudioProcessor for MediaStreamRenderer<R> {
+    /// Media sources are driven from outside the graph and have no incoming edges that could wake
+    /// them up again. They also report `finished` as soon as the stream yields `None`, which today
+    /// cannot tell "paused" from "depleted" (see the note in `process`), so a paused element would
+    /// never resume if we let it go dormant.
+    fn always_active(&self) -> bool {
+        true
+    }
+
     fn process(
         &mut self,
         _inputs: &[AudioRenderQuantum],

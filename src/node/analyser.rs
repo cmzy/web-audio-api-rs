@@ -263,6 +263,12 @@ struct AnalyserRenderer {
 }
 
 impl AudioProcessor for AnalyserRenderer {
+    /// AnalyserNode 必须持续消费输入（即便静音）才能让 FIFO/FFT 反映"当前是静音"；跳过会让
+    /// getFloatTimeDomainData 一直返回停止前的旧波形。
+    fn always_active(&self) -> bool {
+        true
+    }
+
     fn process(
         &mut self,
         inputs: &[AudioRenderQuantum],

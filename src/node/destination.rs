@@ -140,6 +140,11 @@ impl AudioDestinationNode {
 struct DestinationRenderer {}
 
 impl AudioProcessor for DestinationRenderer {
+    /// 整个图的出口——必须每 quantum 产出，否则设备侧断流。
+    fn always_active(&self) -> bool {
+        true
+    }
+
     fn process(
         &mut self,
         inputs: &[AudioRenderQuantum],

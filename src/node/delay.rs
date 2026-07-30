@@ -426,6 +426,15 @@ impl RingBufferChecker for DelayWriter {
 }
 
 impl AudioProcessor for DelayWriter {
+    /// The writer half must run every quantum even with a silent input: writing is what advances
+    /// the ring buffer's time axis. Skipping it freezes the delay line, and the reader half then
+    /// emits stale/misaligned samples (caught by `test_max_delay` and
+    /// `test_subquantum_delay_dynamic_lifetime`). Note `process` deliberately returns `false` here
+    /// - that is about lifecycle (it produces no output of its own), not about being skippable.
+    fn always_active(&self) -> bool {
+        true
+    }
+
     fn process(
         &mut self,
         inputs: &[AudioRenderQuantum],
@@ -513,6 +522,14 @@ impl RingBufferChecker for DelayReader {
 }
 
 impl AudioProcessor for DelayReader {
+    /// The reader half keeps emitting the tail after its source stopped, and it is fed from the
+    /// ring buffer rather than through a graph edge, so upstream activity cannot be used to wake
+    /// it. Always poll it; its own `is_actively_processing` return value already tells the graph
+    /// when the tail has died out.
+    fn always_active(&self) -> bool {
+        true
+    }
+
     fn process(
         &mut self,
         _inputs: &[AudioRenderQuantum], // cannot be used
