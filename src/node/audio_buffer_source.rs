@@ -415,7 +415,13 @@ impl AudioBufferSourceRenderer {
             }
 
             // https://webaudio.github.io/web-audio-api/#dom-audiobuffersourcenode-loopend
-            if self.loop_state.end <= 0. || self.loop_state.end > duration {
+            //
+            // Only an end past the buffer is clamped. An end that is not strictly positive is a
+            // constraint violation, not a request for the whole buffer: rewriting it to `duration`
+            // here would silently pair it with a non-zero `loop_start` and produce a loop the spec
+            // never asks for. The playback algorithm detects the violation and falls back to the
+            // whole buffer -- including resetting the start, which this rewrite used to defeat.
+            if self.loop_state.end > duration {
                 self.loop_state.end = duration;
             }
         }
@@ -485,10 +491,6 @@ impl AudioProcessor for AudioBufferSourceRenderer {
             end: loop_end,
         } = self.loop_state;
 
-        // these will only be used if `loop_` is true, so no need for `Option`
-        let mut actual_loop_start = 0.;
-        let mut actual_loop_end = 0.;
-
         // compute compound parameter at k-rate, these parameters have constraints
         // https://webaudio.github.io/web-audio-api/#audioparam-automation-rate-constraints
         let detune = params.get(&self.detune)[0] as f64;
@@ -497,6 +499,19 @@ impl AudioProcessor for AudioBufferSourceRenderer {
 
         let buffer_length = buffer.length();
         let buffer_duration = buffer.duration();
+
+        // Loop boundaries actually used by the playback algorithm, cf.
+        // https://webaudio.github.io/web-audio-api/#playback-AudioBufferSourceNode
+        // Bounds that are negative, non-positive at the end, or in the wrong order are a
+        // constraint violation and fall back to looping over the whole buffer. Only meaningful
+        // while looping, hence the (0., 0.) placeholder -- no need for an `Option`.
+        let (actual_loop_start, actual_loop_end) = if !is_looping {
+            (0., 0.)
+        } else if loop_start >= 0. && loop_end > 0. && loop_start < loop_end {
+            (loop_start, loop_end.min(buffer_duration))
+        } else {
+            (0., buffer_duration)
+        };
         // multiplier to be applied on `position` to tackle possible difference
         // between the context and buffer sample rates. As this is an edge case,
         // we just linearly interpolate, thus favoring performance vs quality
@@ -540,8 +555,10 @@ impl AudioProcessor for AudioBufferSourceRenderer {
         // For now we just consider that we can go fast track if loop points are
         // bound to the buffer boundaries.
         //
-        // By default, cf. clamp_loop_boundaries, loop_start == 0 && loop_end == buffer_duration,
-        if loop_start != 0. || loop_end != buffer_duration {
+        // Judged on the *actual* boundaries: an unset or violating loop resolves to the whole
+        // buffer and stays on the fast track. When not looping the boundaries are unused, so they
+        // cannot force resampling either.
+        if is_looping && (actual_loop_start != 0. || actual_loop_end != buffer_duration) {
             self.render_state.is_aligned = false;
         }
 
@@ -629,15 +646,7 @@ impl AudioProcessor for AudioBufferSourceRenderer {
             // ---------------------------------------------------------------
             // Slow track
             // ---------------------------------------------------------------
-            if is_looping {
-                if loop_start >= 0. && loop_end > 0. && loop_start < loop_end {
-                    actual_loop_start = loop_start;
-                    actual_loop_end = loop_end;
-                } else {
-                    actual_loop_start = 0.;
-                    actual_loop_end = buffer_duration;
-                }
-            } else {
+            if !is_looping {
                 self.render_state.entered_loop = false;
             }
 
@@ -694,11 +703,22 @@ impl AudioProcessor for AudioBufferSourceRenderer {
                 }
 
                 if is_looping {
-                    if almost::equal(buffer_time, actual_loop_end) {
+                    // Snap the playhead onto a boundary it only misses by accumulated rounding.
+                    // `almost::equal` is a *relative* comparison, so it never fires against a
+                    // boundary of 0 -- exactly the default `actual_loop_start`. A backwards loop
+                    // then leaves `buffer_time` at a tiny negative value instead of 0, the wrap
+                    // below pushes it to just under `actual_loop_end`, and playback repeats the
+                    // last frame instead of continuing at the first one. Comparing the difference
+                    // against zero adds the absolute tolerance that case needs.
+                    if almost::equal(buffer_time, actual_loop_end)
+                        || almost::zero(buffer_time - actual_loop_end)
+                    {
                         buffer_time = actual_loop_end;
                     }
 
-                    if almost::equal(buffer_time, actual_loop_start) {
+                    if almost::equal(buffer_time, actual_loop_start)
+                        || almost::zero(buffer_time - actual_loop_start)
+                    {
                         buffer_time = actual_loop_start;
                     }
 
@@ -778,6 +798,18 @@ impl AudioProcessor for AudioBufferSourceRenderer {
                                         // End of buffer
                                         None => {
                                             if is_looping {
+                                                // The wrapped neighbour is addressed in frames, so it
+                                                // must be clamped to the last existing frame: either
+                                                // boundary may sit exactly on the end of the buffer
+                                                // (a violating or unset loop resolves to the whole
+                                                // buffer), and `duration * sample_rate` is
+                                                // `buffer.length()` -- one past the last frame.
+                                                // Indexing that panicked the render thread, which
+                                                // killed the node and turned every backwards loop
+                                                // reaching the buffer end into silence.
+                                                let last_frame_index =
+                                                    buffer_channel.len().saturating_sub(1);
+
                                                 if playback_rate >= 0. {
                                                     let start_playhead =
                                                         actual_loop_start * sample_rate;
@@ -789,12 +821,15 @@ impl AudioProcessor for AudioBufferSourceRenderer {
                                                         start_playhead as usize + 1
                                                     };
 
-                                                    buffer_channel[start_index] as f64
+                                                    buffer_channel
+                                                        [start_index.min(last_frame_index)]
+                                                        as f64
                                                 } else {
                                                     let end_playhead =
                                                         actual_loop_end * sample_rate;
                                                     let end_index = end_playhead as usize;
-                                                    buffer_channel[end_index] as f64
+                                                    buffer_channel[end_index.min(last_frame_index)]
+                                                        as f64
                                                 }
                                             } else {
                                                 // Handle 2 edge cases:
@@ -1777,6 +1812,53 @@ mod tests {
         let result = context.start_rendering_sync();
         let expected = [4., 3., 2., 4., 3., 2., 4., 3.];
         assert_float_eq!(result.get_channel_data(0)[..8], expected[..], abs_all <= 0.);
+    }
+
+    #[test]
+    fn test_reverse_loop_ending_on_buffer_end() {
+        // A backwards loop whose end sits exactly on the end of the buffer used to index one past
+        // the last frame while interpolating the wrapped neighbour, panicking the render thread
+        // (the node was then dropped from the graph and the output went silent). This covers the
+        // three ways `actual_loop_end` can reach `buffer.duration()`:
+        //   - set explicitly,
+        //   - left at the default 0 / set negative (`clamp_loop_boundaries` rewrites it),
+        //   - loop_start > loop_end, which makes the renderer fall back to the whole buffer.
+        // Both sample rates matter: at 48 kHz the backwards playhead happens to land exactly on
+        // 0 after three decrements, at 44.1 kHz it lands a rounding error below it, which is what
+        // makes the wrap misfire.
+        [48_000., 44_100.].iter().for_each(|&sample_rate| {
+            let dur = 4. / sample_rate as f64;
+
+            [
+                (0., dur),
+                (1. / sample_rate as f64, -2. / sample_rate as f64),
+                (3. / sample_rate as f64, 1. / sample_rate as f64),
+            ]
+            .iter()
+            .for_each(|(loop_start, loop_end)| {
+                let mut context = OfflineAudioContext::new(1, RENDER_QUANTUM_SIZE, sample_rate);
+
+                let mut buffer = context.create_buffer(1, 4, sample_rate);
+                buffer.copy_to_channel(&[1., 2., 3., 4.], 0);
+
+                let mut src = context.create_buffer_source();
+                src.connect(&context.destination());
+                src.set_buffer(buffer);
+                src.set_loop(true);
+                src.set_loop_start(*loop_start);
+                src.set_loop_end(*loop_end);
+                src.playback_rate().set_value(-1.);
+                src.start_at_with_offset(0., 3. / sample_rate as f64);
+
+                let result = context.start_rendering_sync();
+                let expected = [4., 3., 2., 1., 4., 3., 2., 1.];
+                assert_float_eq!(
+                    result.get_channel_data(0)[..8],
+                    expected[..],
+                    abs_all <= 1e-9
+                );
+            });
+        });
     }
 
     #[test]
