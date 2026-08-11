@@ -384,9 +384,13 @@ impl AudioProcessor for ConvolverRenderer {
 
         let convolvers = match &mut self.convolvers {
             None => {
-                // no convolution buffer set, passthrough
-                *output = input.clone();
-                return !input.is_silent();
+                // No impulse response set (buffer is null, or was cleared): a buffer-less
+                // ConvolverNode is not actively processing and MUST emit a single channel of
+                // silence rather than passing the input through. This matches the Web Audio spec
+                // ("if this node is not actively processing, the output is a single channel of
+                // silence") and Blink/Gecko, which zero the convolver output when no buffer is set.
+                output.make_silent();
+                return false;
             }
             Some(convolvers) => convolvers,
         };
@@ -615,16 +619,21 @@ mod tests {
     }
 
     #[test]
-    fn test_passthrough() {
+    fn test_no_buffer_is_silent() {
+        // A ConvolverNode with no impulse response set is not actively processing and MUST
+        // output a single channel of silence - it does NOT pass the input through. This matches
+        // the Web Audio spec ("if this node is not actively processing, the output is a single
+        // channel of silence") and Blink/Gecko (which zero the output when no buffer is set).
         let output = test_convolve(&[0., 1., 0., -1., 0.], None, 10);
-        let expected = [0., 1., 0., -1., 0., 0., 0., 0., 0., 0.];
+        let expected = [0.; 10];
         assert_float_eq!(output.get_channel_data(0), &expected[..], abs_all <= 1E-6);
     }
 
     #[test]
     fn test_clear_buffer() {
         // Setting an impulse response and then clearing it must leave the node in the same state
-        // as one that never had a buffer at all - see `test_passthrough` for that reference state.
+        // as one that never had a buffer at all - see `test_no_buffer_is_silent` for that
+        // reference state: a buffer-less convolver outputs a single channel of silence.
         let sample_rate = 44100.;
         let mut context = OfflineAudioContext::new(1, 10, sample_rate);
 
@@ -642,7 +651,7 @@ mod tests {
         conv.connect(&context.destination());
 
         let output = context.start_rendering_sync();
-        let expected = [0., 1., 0., -1., 0., 0., 0., 0., 0., 0.];
+        let expected = [0.; 10];
         assert_float_eq!(output.get_channel_data(0), &expected[..], abs_all <= 1E-6);
     }
 
