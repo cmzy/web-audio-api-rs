@@ -316,6 +316,23 @@ impl ConvolverNode {
         self.buffer = Some(buffer);
     }
 
+    /// Remove the current impulse response, reverting the node to its buffer-less state
+    ///
+    /// This is the counterpart of [`ConvolverNode::set_buffer`]: bindings for languages whose
+    /// `ConvolverNode.buffer` attribute is nullable need a way to express `buffer = null`.
+    /// Without it the renderer keeps convolving with the previous response forever, while the
+    /// control-side getter already reports `None`.
+    pub fn clear_buffer(&mut self) {
+        let msg = ConvolverInfosMessage {
+            convolvers: None,
+            impulse_length: 0,
+            impulse_number_of_channels: 0,
+        };
+
+        self.registration.post_message(msg);
+        self.buffer = None;
+    }
+
     /// Denotes if the response buffer will be scaled with an equal-power normalization
     pub fn normalize(&self) -> bool {
         self.normalize
@@ -600,6 +617,31 @@ mod tests {
     #[test]
     fn test_passthrough() {
         let output = test_convolve(&[0., 1., 0., -1., 0.], None, 10);
+        let expected = [0., 1., 0., -1., 0., 0., 0., 0., 0., 0.];
+        assert_float_eq!(output.get_channel_data(0), &expected[..], abs_all <= 1E-6);
+    }
+
+    #[test]
+    fn test_clear_buffer() {
+        // Setting an impulse response and then clearing it must leave the node in the same state
+        // as one that never had a buffer at all - see `test_passthrough` for that reference state.
+        let sample_rate = 44100.;
+        let mut context = OfflineAudioContext::new(1, 10, sample_rate);
+
+        let input = AudioBuffer::from(vec![vec![0., 1., 0., -1., 0.]], sample_rate);
+        let mut src = AudioBufferSourceNode::new(&context, AudioBufferSourceOptions::default());
+        src.set_buffer(input);
+        src.start();
+
+        let mut conv = ConvolverNode::new(&context, ConvolverOptions::default());
+        conv.set_buffer(AudioBuffer::from(vec![vec![0., 0., 0., 1.]], sample_rate));
+        conv.clear_buffer();
+        assert!(conv.buffer().is_none());
+
+        src.connect(&conv);
+        conv.connect(&context.destination());
+
+        let output = context.start_rendering_sync();
         let expected = [0., 1., 0., -1., 0., 0., 0., 0., 0., 0.];
         assert_float_eq!(output.get_channel_data(0), &expected[..], abs_all <= 1E-6);
     }
