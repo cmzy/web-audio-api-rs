@@ -726,6 +726,12 @@ pub(crate) struct AudioParamProcessor {
     current_value: Arc<AtomicF32>,
     event_timeline: AudioParamEventTimeline,
     last_event: Option<AudioParamEvent>,
+    /// Start time of the render quantum that will consume the next batch of incoming events.
+    ///
+    /// Needed to clamp automation times that lie in the past **at insertion**. Ongoing automations
+    /// (SetTarget, SetValueCurve) legitimately keep a start time in the past once they are running,
+    /// so the clamp cannot be applied per block -- doing so restarts them every quantum.
+    current_block_time: f64,
     buffer: ArrayVec<f32, RENDER_QUANTUM_SIZE>,
 }
 
@@ -847,7 +853,19 @@ impl AudioParamProcessor {
         }
     }
 
-    fn handle_incoming_event(&mut self, event: AudioParamEvent) {
+    fn handle_incoming_event(&mut self, mut event: AudioParamEvent) {
+        // Clamp a past `startTime` **once, here**, for the automations that keep running across
+        // quanta: SetTarget and SetValueCurve legitimately hold a start time in the past while
+        // they are in progress, so the computation side cannot clamp them per block (that would
+        // restart them every quantum). One-shot events (SetValueAtTime, ramps) are clamped on the
+        // computation side instead, where the exact block time is known.
+        if matches!(
+            event.event_type,
+            AudioParamEventType::SetTargetAtTime | AudioParamEventType::SetValueCurveAtTime
+        ) {
+            event.time = Self::clamp_event_time_to_now(event.time, self.current_block_time);
+        }
+
         // cf. https://www.w3.org/TR/webaudio/#computation-of-value
         // 1. paramIntrinsicValue will be calculated at each time, which is either the
         // value set directly to the value attribute, or, if there are any automation
@@ -1160,15 +1178,9 @@ impl AudioParamProcessor {
         let event = self.event_timeline.peek().unwrap();
         let mut time = event.time;
 
-        // `set_value` and implicitly inserted events are inserted with `time = 0.`,
-        // so that we ensure they are processed first. Replacing their `time` with
-        // `block_time` allows to conform to the spec:
-        // cf. https://www.w3.org/TR/webaudio/#dom-audioparam-value
-        // cf. https://www.w3.org/TR/webaudio/#dom-audioparam-linearramptovalueattime
-        // cf. https://www.w3.org/TR/webaudio/#dom-audioparam-exponentialramptovalueattime
-        if time == 0. {
-            time = infos.block_time;
-        }
+        // Past times clamp to now; see clamp_event_time_to_now. The rewrite below stores the
+        // clamped time back into `last_event`, so a following ramp picks it up as its start time.
+        time = Self::clamp_event_time_to_now(time, infos.block_time);
 
         // fill buffer with current intrinsic value until `event.time`
         if infos.is_a_rate {
@@ -1656,6 +1668,28 @@ impl AudioParamProcessor {
     ///     a-rate machinery evaluates them at block_time into buffer[0]).
     /// last_event bookkeeping mirrors the corresponding main-loop branches
     /// (subsequent ramps depend on it for their start point).
+    /// Automation times that lie in the past are clamped to the current time.
+    ///
+    /// Two cases share this rule:
+    ///  * `set_value` and implicitly inserted events are queued with `time = 0.` so that they sort
+    ///    first (cf. #dom-audioparam-value, #dom-audioparam-linearramptovalueattime,
+    ///    #dom-audioparam-exponentialramptovalueattime);
+    ///  * a user-supplied time simply in the past, e.g. `setValueAtTime(v, 0.5 * currentTime)`.
+    ///    The spec clamps such a `startTime` to `currentTime`, so the event must behave exactly
+    ///    like one scheduled now. Keeping the original time makes a ramp anchored on that event
+    ///    look as if it had already been running, so it starts from a partially advanced value.
+    ///
+    /// Both the catch-up pass and the main timeline loop consume head events, so **both** must
+    /// apply this; they used to carry a copy of the `time == 0.` half each, and the past-time half
+    /// was missing from both (WPT webaudio retrospective-*.html).
+    fn clamp_event_time_to_now(time: f64, block_time: f64) -> f64 {
+        if time < block_time {
+            block_time
+        } else {
+            time
+        }
+    }
+
     fn catch_up_head_events(&mut self, block_time: f64) {
         loop {
             let Some(event) = self.event_timeline.peek() else {
@@ -1663,10 +1697,7 @@ impl AudioParamProcessor {
             };
             match event.event_type {
                 AudioParamEventType::SetValue | AudioParamEventType::SetValueAtTime => {
-                    let mut time = event.time;
-                    if time == 0. {
-                        time = block_time;
-                    }
+                    let time = Self::clamp_event_time_to_now(event.time, block_time);
                     if time > block_time {
                         return;
                     }
@@ -1721,7 +1752,12 @@ impl AudioParamProcessor {
                     };
                     self.intrinsic_value = value;
                     let mut ev = self.event_timeline.pop().unwrap();
-                    ev.time = end_time;
+                    // The completed event becomes the anchor for whatever automation follows, so its
+                    // time must be clamped too: a ramp whose *end* time is in the past (e.g.
+                    // `linearRampToValueAtTime(v, 0.5 * currentTime)`) is already finished, and the
+                    // next ramp has to start from now. Leaving the past end time here made that next
+                    // ramp look as if it had been running since then, so it began part-way up.
+                    ev.time = Self::clamp_event_time_to_now(end_time, block_time);
                     ev.value = value;
                     self.last_event = Some(ev);
                 }
@@ -1740,7 +1776,7 @@ impl AudioParamProcessor {
                         compute_set_value_curve_sample(start_time, duration, values, end_time);
                     self.intrinsic_value = value;
                     let mut ev = self.event_timeline.pop().unwrap();
-                    ev.time = end_time;
+                    ev.time = Self::clamp_event_time_to_now(end_time, block_time); // see the ramp branch
                     ev.value = value;
                     self.last_event = Some(ev);
                 }
@@ -1763,6 +1799,9 @@ impl AudioParamProcessor {
 
         let is_a_rate = self.automation_rate.is_a_rate();
         let next_block_time = dt.mul_add(count as f64, block_time);
+        // Events posted after this quantum are first seen by the *next* one, so that is "now" as
+        // far as clamping a past startTime at insertion is concerned (see handle_incoming_event).
+        self.current_block_time = next_block_time;
 
         // Settle queued head events that take effect at or before the first
         // frame of this block (SetValue/SetValueAtTime at the block boundary,
@@ -1955,6 +1994,7 @@ pub(crate) fn audio_param_pair(
         automation_rate,
         event_timeline: AudioParamEventTimeline::new(),
         last_event: None,
+        current_block_time: 0.,
         buffer: ArrayVec::new(),
     };
 
@@ -2117,6 +2157,43 @@ mod tests {
             assert_float_eq!(param.value(), 1., abs_all <= 0.);
             assert_float_eq!(vs, &[2.][..], abs_all <= 0.); // constant block: single-valued
         }
+    }
+
+    // Automation times in the past must be clamped to the current time, so that a ramp anchored on
+    // such an event starts *now* instead of appearing to have been running since that past time.
+    // Mirrors WPT webaudio retrospective-*.html: one param gets `setValueAtTime(v, 0.5 * now)`, the
+    // other `setValueAtTime(v, now)`, both followed by the same ramp; the rendered blocks must match.
+    #[test]
+    fn test_retrospective_event_times_are_clamped_to_now() {
+        let context = OfflineAudioContext::new(1, 1, 48000.);
+        let opts = || AudioParamDescriptor {
+            name: String::new(),
+            automation_rate: AutomationRate::A,
+            default_value: 1.,
+            min_value: -1e6,
+            max_value: 1e6,
+        };
+
+        let dt = 1.;
+        let now = 10.; // block under test starts here; anything < now is "in the past"
+
+        let (past_param, mut past) = audio_param_pair(opts(), context.mock_registration());
+        let (now_param, mut now_render) = audio_param_pair(opts(), context.mock_registration());
+
+        // advance both to `now` with no events pending
+        let _ = past.compute_intrinsic_values(0., dt, 10);
+        let _ = now_render.compute_intrinsic_values(0., dt, 10);
+
+        past.handle_incoming_event(past_param.set_value_at_time_raw(0., 0.5 * now));
+        past.handle_incoming_event(past_param.linear_ramp_to_value_at_time_raw(10., now + 10.));
+        now_render.handle_incoming_event(now_param.set_value_at_time_raw(0., now));
+        now_render.handle_incoming_event(now_param.linear_ramp_to_value_at_time_raw(10., now + 10.));
+
+        let a: Vec<f32> = past.compute_intrinsic_values(now, dt, 10).to_vec();
+        let b: Vec<f32> = now_render.compute_intrinsic_values(now, dt, 10).to_vec();
+        assert_float_eq!(&a[..], &b[..], abs_all <= 0.);
+        // and the ramp must genuinely start at 0 now, not at a partially advanced value
+        assert_float_eq!(a[0], 0., abs_all <= 0.);
     }
 
     #[test]

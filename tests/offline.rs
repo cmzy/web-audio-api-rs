@@ -265,3 +265,56 @@ fn test_repeated_connect_with_identical_termini_is_a_single_connection() {
     constant.disconnect_dest(&context.destination());
     constant.connect(&context.destination());
 }
+
+// WPT webaudio retrospective-setValueAtTime.html, transcribed: an automation time in the past must
+// clamp to the current time, so a ramp anchored on it starts *now* rather than appearing to have
+// been running since that past time. Two identical graphs, the only difference being the startTime
+// passed to setValueAtTime; every rendered sample must match.
+#[test]
+fn test_retrospective_set_value_at_time_clamps_to_now() {
+    use web_audio_api::context::{BaseAudioContext, OfflineAudioContext};
+    use web_audio_api::node::{AudioNode, AudioScheduledSourceNode};
+
+    let length = 16384;
+    let sample_rate = 16384.;
+    let suspend_frame = 128;
+
+    let mut context = OfflineAudioContext::new(2, length, sample_rate);
+    let mut source = context.create_constant_source();
+    let test = context.create_gain();
+    let reference = context.create_gain();
+    source.connect(&test);
+    source.connect(&reference);
+
+    let merger = context.create_channel_merger(2);
+    test.connect_from_output_to_input(&merger, 0, 0);
+    reference.connect_from_output_to_input(&merger, 0, 1);
+    merger.connect(&context.destination());
+
+    let ramp_end = (length - suspend_frame) as f32;
+    let ramp_end_seconds = length as f64 / sample_rate as f64;
+
+    let test_gain = test.gain().clone();
+    let reference_gain = reference.gain().clone();
+    context.suspend_sync(suspend_frame as f64 / sample_rate as f64, move |ctx| {
+        let now = ctx.current_time();
+        test_gain.set_value_at_time(0., 0.5 * now); // in the past
+        test_gain.linear_ramp_to_value_at_time(ramp_end, ramp_end_seconds);
+        reference_gain.set_value_at_time(0., now);
+        reference_gain.linear_ramp_to_value_at_time(ramp_end, ramp_end_seconds);
+    });
+
+    source.start();
+    let buffer = context.start_rendering_sync();
+    let actual = buffer.get_channel_data(0);
+    let expected = buffer.get_channel_data(1);
+
+    for i in suspend_frame..length {
+        assert!(
+            (actual[i] - expected[i]).abs() < 1e-6,
+            "sample {i}: test {} != reference {}",
+            actual[i],
+            expected[i]
+        );
+    }
+}
