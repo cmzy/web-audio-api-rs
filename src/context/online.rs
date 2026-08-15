@@ -1043,7 +1043,6 @@ mod tests {
 #[cfg(test)]
 mod render_stall_tests {
     use super::*;
-    use crate::node::AudioNode;
 
     #[test]
     fn test_stall_detector_does_not_misfire_on_suspended_context() {
