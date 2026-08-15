@@ -483,7 +483,11 @@ impl AudioProcessor for WaveShaperRenderer {
         }
 
         // @tbc - rubato::FftFixedInOut doesn't seem to introduce any latency
-        false
+        //
+        // A curve whose centre is not zero maps silence to a non-zero constant, so the node keeps
+        // producing output after its input goes silent. Report that as tail time, otherwise the
+        // graph puts the node to sleep once the upstream is idle and forces its output silent.
+        !self.can_propagate_silence
     }
 
     fn onmessage(&mut self, msg: &mut dyn Any) {
@@ -738,5 +742,25 @@ mod tests {
         let channel = result.get_channel_data(0);
 
         assert_float_eq!(channel[..], expected[..], abs_all <= 0.);
+    }
+
+    #[test]
+    fn non_zero_centre_curve_keeps_producing_without_input() {
+        // A curve whose centre is not zero maps silence to a constant, so the node must keep
+        // emitting that constant for as long as it is connected - including the quanta after the
+        // graph has decided the upstream is idle.
+        let mut context = OfflineAudioContext::new(1, 256, 44100.);
+
+        let mut shaper = context.create_wave_shaper();
+        shaper.set_curve(vec![0.5; 3]);
+        shaper.connect(&context.destination());
+
+        let result = context.start_rendering_sync();
+
+        assert_float_eq!(
+            result.get_channel_data(0)[..],
+            vec![0.5; 256][..],
+            abs_all <= 0.
+        );
     }
 }
