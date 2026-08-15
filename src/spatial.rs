@@ -319,7 +319,13 @@ pub fn angle(
     }
     let normalized_source_orientation = vec3_normalized(source_orientation);
 
-    let relative_pos = vec3_sub(source_position, listener_position);
+    // The cone is measured from the source *towards the listener*, so the vector runs
+    // listener - source. The specification's pseudo-code reuses the vector it built for the azimuth
+    // (source - listener) here, which inverts the cone: a source facing the listener would land at
+    // 180 degrees and be attenuated to coneOuterGain, while one facing away would be at full gain.
+    // The variable is even named `sourceToListener` there, and WPT's
+    // panner-orientation-cone-gain-changes pins the physical reading.
+    let relative_pos = vec3_sub(listener_position, source_position);
     // Handle degenerate case if source and listener are at the same point.
     if vec3_square_len(relative_pos) <= f32::MIN_POSITIVE {
         return 0.;
