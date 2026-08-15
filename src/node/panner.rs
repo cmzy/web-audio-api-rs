@@ -964,22 +964,43 @@ impl PannerRenderer {
                 let max_distance = self.max_distance;
                 let d2ref = ref_distance.min(max_distance);
                 let d2max = ref_distance.max(max_distance);
-                let d_clamped = distance.clamp(d2ref, d2max);
-                1. - rolloff_factor * (d_clamped - d2ref) / (d2max - d2ref)
+                if d2max == d2ref {
+                    // Degenerate ramp: the formula's denominator vanishes and the clamped distance
+                    // collapses onto it, so the quotient is 0/0. The distance is at the far end of
+                    // a zero-width ramp, hence full rolloff.
+                    1. - rolloff_factor
+                } else {
+                    let d_clamped = distance.clamp(d2ref, d2max);
+                    1. - rolloff_factor * (d_clamped - d2ref) / (d2max - d2ref)
+                }
             }
             DistanceModelType::Inverse => {
                 let rolloff_factor = self.rolloff_factor.max(0.);
-                if distance > 0. {
-                    ref_distance
-                        / (ref_distance
-                            + rolloff_factor * (ref_distance.max(distance) - ref_distance))
+                let denom =
+                    ref_distance + rolloff_factor * (ref_distance.max(distance) - ref_distance);
+                if distance > 0. && denom != 0. {
+                    ref_distance / denom
+                } else if distance > 0. {
+                    // A zero reference distance with no rolloff leaves 0/0; the source is beyond
+                    // any audible reference, so it is fully attenuated.
+                    0.
                 } else {
                     1.
                 }
             }
             DistanceModelType::Exponential => {
                 let rolloff_factor = self.rolloff_factor.max(0.);
-                (distance.max(ref_distance) / ref_distance).powf(-rolloff_factor)
+                if ref_distance <= 0. {
+                    // The ratio diverges; the limit is 0 for any real rolloff, and a zero rolloff
+                    // makes the whole model a no-op.
+                    if rolloff_factor == 0. {
+                        1.
+                    } else {
+                        0.
+                    }
+                } else {
+                    (distance.max(ref_distance) / ref_distance).powf(-rolloff_factor)
+                }
             }
         };
         dist_gain as f32
@@ -1004,10 +1025,16 @@ fn apply_mono_to_stereo_gain(spatial_params: SpatialParams, l: &mut f32, r: &mut
         azimuth = 180. - azimuth;
     }
 
-    // x is the horizontal plane orientation of the sound
-    let x = (azimuth + 90.) / 180.;
-    let gain_l = (x * PI / 2.).cos();
-    let gain_r = (x * PI / 2.).sin();
+    // x is the horizontal plane orientation of the sound.
+    //
+    // The gains are computed in f64 and only narrowed at the end. In f32 `cos(PI/2)` is -4.37e-8
+    // rather than ~0, which is large enough to (a) blow the 1.16e-6 error budget WPT allows for the
+    // equal-power curve and (b) leave a visible imbalance at azimuth 0, where the two ears must come
+    // out equal. In f64 the same term is 6.1e-17, i.e. below the f32 ulp of the samples it scales,
+    // so it vanishes on narrowing instead of accumulating.
+    let x = f64::from(azimuth + 90.) / 180.;
+    let gain_l = (x * std::f64::consts::PI / 2.).cos() as f32;
+    let gain_r = (x * std::f64::consts::PI / 2.).sin() as f32;
 
     // multiply signal with gain per ear
     *l *= gain_l * dist_gain * cone_gain;
@@ -1038,14 +1065,14 @@ fn apply_stereo_to_stereo_gain(
         azimuth = 180. - azimuth;
     }
 
-    // x is the horizontal plane orientation of the sound
+    // x is the horizontal plane orientation of the sound. Gains in f64, see the mono path for why.
     let x = if azimuth <= 0. {
-        (azimuth + 90.) / 90.
+        f64::from(azimuth + 90.) / 90.
     } else {
-        azimuth / 90.
+        f64::from(azimuth) / 90.
     };
-    let gain_l = (x * PI / 2.).cos();
-    let gain_r = (x * PI / 2.).sin();
+    let gain_l = (x * std::f64::consts::PI / 2.).cos() as f32;
+    let gain_r = (x * std::f64::consts::PI / 2.).sin() as f32;
 
     // multiply signal with gain per ear
     if azimuth <= 0. {
@@ -1355,6 +1382,8 @@ mod arate_position_tests {
     use crate::context::{BaseAudioContext, OfflineAudioContext};
     use crate::node::{AudioNode, AudioScheduledSourceNode};
 
+    use super::*;
+
     #[test]
     fn test_arate_position_automation_varies_within_quantum() {
         // The EqualPower fast path decides whether spatialization parameters
@@ -1392,5 +1421,44 @@ mod arate_position_tests {
             varies,
             "position automation was evaluated once per quantum (k-rate degradation)"
         );
+    }
+
+    #[test]
+    fn degenerate_distance_params_stay_finite() {
+        // The distance formulas have removable singularities: the linear model divides by
+        // (maxDistance - refDistance) and the exponential one by refDistance. Either one going to
+        // zero used to leak NaN/Inf into every rendered sample.
+        for (model, ref_distance, max_distance) in [
+            (DistanceModelType::Linear, 1., 1.),
+            (DistanceModelType::Exponential, 0., 10000.),
+            (DistanceModelType::Inverse, 0., 10000.),
+        ] {
+            let mut context = OfflineAudioContext::new(2, 256, 48000.);
+
+            let mut src = context.create_constant_source();
+            src.offset().set_value(1.);
+            src.start();
+
+            let mut panner = context.create_panner();
+            panner.set_distance_model(model);
+            panner.set_ref_distance(ref_distance);
+            panner.set_max_distance(max_distance);
+            panner.set_rolloff_factor(1.);
+            panner.position_x().set_value(10.);
+
+            src.connect(&panner);
+            panner.connect(&context.destination());
+
+            let result = context.start_rendering_sync();
+            for channel in 0..result.number_of_channels() {
+                for (i, s) in result.get_channel_data(channel).iter().enumerate() {
+                    assert!(
+                        s.is_finite(),
+                        "{model:?} refDistance={ref_distance} maxDistance={max_distance}: \
+                         channel {channel} frame {i} is {s}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -1,5 +1,4 @@
 //! The stereo panner control and renderer parts
-use std::f32::consts::PI;
 
 use crate::context::{AudioContextRegistration, AudioParamId, BaseAudioContext};
 use crate::param::{AudioParam, AudioParamDescriptor};
@@ -72,10 +71,14 @@ fn assert_valid_channel_count_mode(mode: ChannelCountMode) {
 /// - `gain_right = (x * PI / 2.).sin()`
 #[inline(always)]
 fn get_stereo_gains(x: f32) -> [f32; 2] {
-    let gain_left = ((1. - x) * PI / 2.).sin(); // more accurate than cos()
-    let gain_right = (x * PI / 2.).sin();
+    // Evaluated in f64 and narrowed only at the end: the f32 sine costs about an ulp of the result,
+    // which is the same order as the error budget the conformance suite allows on the whole curve.
+    let x = f64::from(x);
+    let half_pi = std::f64::consts::FRAC_PI_2;
+    let gain_left = ((1. - x) * half_pi).sin(); // more accurate than cos()
+    let gain_right = (x * half_pi).sin();
 
-    [gain_left, gain_right]
+    [gain_left as f32, gain_right as f32]
 }
 
 /// `StereoPannerNode` positions an incoming audio stream in a stereo image

@@ -197,9 +197,7 @@ pub(crate) struct AudioListenerParams {
     pub up_z: AudioParamInner,
 }
 
-use vecmath::{
-    vec3_cross, vec3_dot, vec3_len, vec3_normalized, vec3_scale, vec3_square_len, vec3_sub, Vector3,
-};
+use vecmath::{vec3_dot, vec3_len, vec3_normalized, vec3_square_len, vec3_sub, Vector3};
 
 /// Direction to source position measured from listener in 3D
 pub fn azimuth_and_elevation(
@@ -208,52 +206,87 @@ pub fn azimuth_and_elevation(
     listener_forward: Vector3<f32>,
     listener_up: Vector3<f32>,
 ) -> (f32, f32) {
-    let relative_pos = vec3_sub(source_position, listener_position);
+    // Computed in f64 throughout, narrowed only on return.
+    //
+    // The chain is normalize -> dot -> acos -> degrees, and `acos` loses a lot of precision in f32
+    // near +-1, which is exactly where a source in front of the listener sits. The resulting angular
+    // error feeds straight into the equal-power gain curve; WPT's panner tests allow 1.16e-6 on that
+    // curve and the f32 chain overshot it. Positions and orientations stay f32 at the API boundary.
+    type V = (f64, f64, f64);
+    let v = |a: Vector3<f32>| -> V { (f64::from(a[0]), f64::from(a[1]), f64::from(a[2])) };
+    let sub = |a: V, b: V| -> V { (a.0 - b.0, a.1 - b.1, a.2 - b.2) };
+    let dot = |a: V, b: V| -> f64 { a.0.mul_add(b.0, a.1.mul_add(b.1, a.2 * b.2)) };
+    let cross = |a: V, b: V| -> V {
+        (
+            a.1 * b.2 - a.2 * b.1,
+            a.2 * b.0 - a.0 * b.2,
+            a.0 * b.1 - a.1 * b.0,
+        )
+    };
+    let square_len = |a: V| -> f64 { dot(a, a) };
+    let scale = |a: V, k: f64| -> V { (a.0 * k, a.1 * k, a.2 * k) };
+    let normalized = |a: V| -> V {
+        let len = square_len(a).sqrt();
+        if len == 0. {
+            a
+        } else {
+            scale(a, 1. / len)
+        }
+    };
+
+    let relative_pos = sub(v(source_position), v(listener_position));
 
     // Handle degenerate case if source and listener are at the same point.
-    if vec3_square_len(relative_pos) <= f32::MIN_POSITIVE {
+    if square_len(relative_pos) <= f64::from(f32::MIN_POSITIVE) {
         return (0., 0.);
     }
 
     // Calculate the source-listener vector.
-    let source_listener = vec3_normalized(relative_pos);
+    let source_listener = normalized(relative_pos);
 
     // Align axes.
-    let listener_right = vec3_cross(listener_forward, listener_up);
+    let listener_right = cross(v(listener_forward), v(listener_up));
 
-    if vec3_square_len(listener_right) == 0. {
-        // Handle the case where listener’s 'up' and 'forward' vectors are linearly dependent, in
+    if square_len(listener_right) == 0. {
+        // Handle the case where listener's 'up' and 'forward' vectors are linearly dependent, in
         // which case 'right' cannot be determined
         return (0., 0.);
     }
 
-    // Determine a unit vector orthogonal to listener’s right, forward
-    let listener_right_norm = vec3_normalized(listener_right);
-    let listener_forward_norm = vec3_normalized(listener_forward);
-    let up = vec3_cross(listener_right_norm, listener_forward_norm);
+    // Determine a unit vector orthogonal to listener's right, forward
+    let listener_right_norm = normalized(listener_right);
+    let listener_forward_norm = normalized(v(listener_forward));
+    let up = cross(listener_right_norm, listener_forward_norm);
 
     // Determine elevation first
-    let mut elevation = 90. - 180. * vec3_dot(source_listener, up).acos() / PI;
+    let mut elevation =
+        90. - 180. * dot(source_listener, up).clamp(-1., 1.).acos() / std::f64::consts::PI;
     if elevation > 90. {
         elevation = 180. - elevation;
     } else if elevation < -90. {
         elevation = -180. - elevation;
     }
 
-    let up_projection = vec3_dot(source_listener, up);
-    let projected_source = vec3_sub(source_listener, vec3_scale(up, up_projection));
+    let up_projection = dot(source_listener, up);
+    let projected_source = sub(source_listener, scale(up, up_projection));
 
     // this case is not handled by the spec, so I stole the solution from
     // https://hg.mozilla.org/mozilla-central/rev/1100a5bc013b541c635bc42bd753531e95c952e4
-    if vec3_square_len(projected_source) == 0. {
-        return (0., elevation);
+    if square_len(projected_source) == 0. {
+        return (0., elevation as f32);
     }
-    let projected_source = vec3_normalized(projected_source);
+    let projected_source = normalized(projected_source);
 
-    let mut azimuth = 180. * vec3_dot(projected_source, listener_right_norm).acos() / PI;
+    // `acos` is only defined on [-1, 1]; rounding can push a dot product of two unit vectors a hair
+    // outside, which yields NaN and poisons the whole gain chain.
+    let mut azimuth = 180.
+        * dot(projected_source, listener_right_norm)
+            .clamp(-1., 1.)
+            .acos()
+        / std::f64::consts::PI;
 
     // Source in front or behind the listener.
-    let front_back = vec3_dot(projected_source, listener_forward_norm);
+    let front_back = dot(projected_source, listener_forward_norm);
     if front_back < 0. {
         azimuth = 360. - azimuth;
     }
@@ -266,7 +299,7 @@ pub fn azimuth_and_elevation(
         azimuth = 450. - azimuth;
     }
 
-    (azimuth, elevation)
+    (azimuth as f32, elevation as f32)
 }
 
 /// Distance between two points in 3D

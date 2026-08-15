@@ -2187,7 +2187,8 @@ mod tests {
         past.handle_incoming_event(past_param.set_value_at_time_raw(0., 0.5 * now));
         past.handle_incoming_event(past_param.linear_ramp_to_value_at_time_raw(10., now + 10.));
         now_render.handle_incoming_event(now_param.set_value_at_time_raw(0., now));
-        now_render.handle_incoming_event(now_param.linear_ramp_to_value_at_time_raw(10., now + 10.));
+        now_render
+            .handle_incoming_event(now_param.linear_ramp_to_value_at_time_raw(10., now + 10.));
 
         let a: Vec<f32> = past.compute_intrinsic_values(now, dt, 10).to_vec();
         let b: Vec<f32> = now_render.compute_intrinsic_values(now, dt, 10).to_vec();
