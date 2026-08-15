@@ -5,7 +5,6 @@ mod test;
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::panic::{self, AssertUnwindSafe};
 
 use crate::context::AudioNodeId;
@@ -13,6 +12,7 @@ use crate::context::AudioNodeId;
 use crate::context::{AudioGraphDiagnostics, AudioGraphEdgeDiagnostics, AudioNodeDiagnostics};
 use smallvec::{smallvec, SmallVec};
 
+use super::node_collection::AudioNodeIdSet;
 use super::{Alloc, AudioParamValues, AudioProcessor, AudioRenderQuantum, NodeCollection};
 use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
 use crate::render::AudioWorkletGlobalScope;
@@ -144,11 +144,11 @@ pub(crate) struct Graph {
     /// Topological ordering of the nodes
     ordered: Vec<AudioNodeId>,
     /// Topological sorting helper
-    marked: HashSet<AudioNodeId>,
+    marked: AudioNodeIdSet,
     /// Topological sorting helper
     marked_temp: Vec<AudioNodeId>,
     /// Topological sorting helper
-    in_cycle: HashSet<AudioNodeId>,
+    in_cycle: AudioNodeIdSet,
     /// Topological sorting helper
     cycle_breakers: Vec<AudioNodeId>,
 }
@@ -169,9 +169,9 @@ impl Graph {
             alloc: Alloc::with_capacity(64),
             reclaim_id_channel,
             ordered: vec![],
-            marked: HashSet::new(),
+            marked: AudioNodeIdSet::default(),
             marked_temp: vec![],
-            in_cycle: HashSet::new(),
+            in_cycle: AudioNodeIdSet::default(),
             cycle_breakers: vec![],
         }
     }
@@ -303,7 +303,11 @@ impl Graph {
                 edge.other_id != dest.0 || edge.self_index != source.1 || edge.other_index != dest.1
             });
 
-        self.ordered.clear(); // void current ordering
+        // Removing an edge cannot invalidate an existing topological order. Re-sort only when
+        // this removal may release nodes that were omitted because they are part of a cycle.
+        if !self.in_cycle.is_empty() {
+            self.ordered.clear();
+        }
     }
 
     pub fn mark_control_handle_dropped(&mut self, index: AudioNodeId) {
@@ -353,10 +357,10 @@ impl Graph {
     fn visit(
         &self,
         node_id: AudioNodeId,
-        marked: &mut HashSet<AudioNodeId>,
+        marked: &mut AudioNodeIdSet,
         marked_temp: &mut Vec<AudioNodeId>,
         ordered: &mut Vec<AudioNodeId>,
-        in_cycle: &mut HashSet<AudioNodeId>,
+        in_cycle: &mut AudioNodeIdSet,
         cycle_breakers: &mut Vec<AudioNodeId>,
     ) -> bool {
         // If this node is in the cycle detection list, it is part of a cycle!
@@ -775,6 +779,43 @@ mod tests {
             .position(|&n| n == AudioNodeId(2))
             .unwrap();
         assert!(pos2 < pos1); // node 1 depends on node 2
+    }
+
+    #[test]
+    fn remove_edge_preserves_acyclic_ordering() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        let node = Box::new(TestNode { tail_time: false });
+        add_node(&mut graph, 0, node.clone());
+        add_node(&mut graph, 1, node);
+        add_edge(&mut graph, 1, 0);
+        graph.order_nodes();
+
+        let ordered = graph.ordered.clone();
+        graph.remove_edge((AudioNodeId(1), 0), (AudioNodeId(0), 0));
+
+        assert_eq!(graph.ordered, ordered);
+    }
+
+    #[test]
+    fn remove_edge_invalidates_ordering_with_cycle() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        let node = Box::new(TestNode { tail_time: false });
+        add_node(&mut graph, 0, node.clone());
+        add_node(&mut graph, 1, node.clone());
+        add_node(&mut graph, 2, node);
+        add_edge(&mut graph, 1, 2);
+        add_edge(&mut graph, 2, 1);
+        graph.order_nodes();
+
+        assert!(graph.in_cycle.contains(&AudioNodeId(1)));
+        assert!(graph.in_cycle.contains(&AudioNodeId(2)));
+
+        graph.remove_edge((AudioNodeId(2), 0), (AudioNodeId(1), 0));
+        assert!(graph.ordered.is_empty());
+
+        graph.order_nodes();
+        assert!(graph.ordered.contains(&AudioNodeId(1)));
+        assert!(graph.ordered.contains(&AudioNodeId(2)));
     }
 
     #[test]

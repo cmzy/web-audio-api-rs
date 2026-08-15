@@ -1,5 +1,15 @@
 # Version History
 
+## Version 1.7.0 (2026-08-06)
+
+- Fix: Deduplicate connections between the same nodes
+- Fix: Avoid panic by disallowing input streams with more than `MAX_CHANNELS` (32) channels
+- Fix: EqualPower PannerNode now applies a-rate source position/orientation automation per sample
+- Fix: Preserve multichannel audio when mixing aliased channels beyond stereo
+- Fix: HRTF output volume is now independent from sample rate
+- Fix: HRTF panning works properly for sample rates < 28kHz
+- Improved graph reordering performance for large graphs
+
 ## Version 1.6.0 (2026-06-20)
 
 - Updated cpal to 0.18 for improved device disconnect/reconnect behaviour
