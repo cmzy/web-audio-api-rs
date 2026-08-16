@@ -390,7 +390,12 @@ impl AudioProcessor for DynamicsCompressorRenderer {
 
         let mut prev_detector_value = self.prev_detector_value;
 
-        let mut reduction_gain = 0.; // dB
+        // Gain reduction applied by the compressor, in dB and without the makeup gain. This is
+        // what `reduction` reports: the specification defines it as "the current amount of gain
+        // reduction", so a compressor that is not compressing anything reads 0 even though it is
+        // applying makeup gain on top. The gain actually applied to the samples is this plus the
+        // makeup gain, which is what `reduction_gains` below holds.
+        let mut reduction_db = 0.; // dB
         let mut reduction_gains = [0.; 128]; // lin
         let mut detector_values = [0.; 128]; // lin
 
@@ -436,10 +441,10 @@ impl AudioProcessor for DynamicsCompressorRenderer {
             };
 
             detector_values[i] = detector_value;
+            reduction_db = -detector_value;
             // cdB = -yL + make up gain
-            reduction_gain = -detector_value + makeup_gain;
             // convert to lin now, so we just to multiply samples later
-            reduction_gains[i] = db_to_lin(reduction_gain);
+            reduction_gains[i] = db_to_lin(reduction_db + makeup_gain);
             // update prev_detector_value for next sample
             prev_detector_value = detector_value;
         }
@@ -447,7 +452,7 @@ impl AudioProcessor for DynamicsCompressorRenderer {
         // update prev_detector_value for next block
         self.prev_detector_value = prev_detector_value;
         // update reduction shared w/ main thread
-        self.reduction.store(reduction_gain, Ordering::Relaxed);
+        self.reduction.store(reduction_db, Ordering::Relaxed);
 
         // store input in delay line
         self.ring_buffer[self.ring_index] = input;
@@ -519,6 +524,59 @@ mod tests {
         assert_float_eq!(compressor.ratio().value(), 1., abs <= 0.);
         assert_float_eq!(compressor.release().value(), 0.75, abs <= 0.);
         assert_float_eq!(compressor.threshold().value(), -60., abs <= 0.);
+    }
+
+    #[test]
+    fn test_reduction_excludes_the_makeup_gain() {
+        let sample_rate = 44_100.;
+        let mut context = OfflineAudioContext::new(1, RENDER_QUANTUM_SIZE * 4, sample_rate);
+
+        let compressor = DynamicsCompressorNode::new(&context, Default::default());
+        compressor.connect(&context.destination());
+
+        // A silent input keeps the compressor below its threshold, so it is not reducing
+        // anything. `reduction` is defined as "the current amount of gain reduction", which is
+        // 0 dB here -- the makeup gain the node applies on top of the signal is not part of it.
+        // Reporting the sum instead made a freshly built compressor read 4.95 dB (the makeup
+        // gain of the default curve) as soon as one render quantum had gone through it.
+        let mut buffer = context.create_buffer(1, RENDER_QUANTUM_SIZE * 2, sample_rate);
+        buffer.copy_to_channel(&[0.; RENDER_QUANTUM_SIZE * 2], 0);
+
+        let mut src = context.create_buffer_source();
+        src.set_buffer(buffer);
+        src.connect(&compressor);
+        src.start();
+
+        let _ = context.start_rendering_sync();
+
+        assert_float_eq!(compressor.reduction(), 0., abs <= 0.);
+    }
+
+    #[test]
+    fn test_reduction_is_negative_while_compressing() {
+        let sample_rate = 44_100.;
+        let mut context = OfflineAudioContext::new(1, RENDER_QUANTUM_SIZE * 8, sample_rate);
+
+        let compressor = DynamicsCompressorNode::new(&context, Default::default());
+        compressor.connect(&context.destination());
+
+        // Full-scale input sits well above the threshold, so the compressor is pulling the
+        // signal down and has to say so with a negative value.
+        let mut buffer = context.create_buffer(1, RENDER_QUANTUM_SIZE * 6, sample_rate);
+        buffer.copy_to_channel(&[1.; RENDER_QUANTUM_SIZE * 6], 0);
+
+        let mut src = context.create_buffer_source();
+        src.set_buffer(buffer);
+        src.connect(&compressor);
+        src.start();
+
+        let _ = context.start_rendering_sync();
+
+        assert!(
+            compressor.reduction() < 0.,
+            "expected gain reduction to be reported as negative dB, got {}",
+            compressor.reduction()
+        );
     }
 
     #[test]
