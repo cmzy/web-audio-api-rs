@@ -732,6 +732,12 @@ pub(crate) struct AudioParamProcessor {
     /// (SetTarget, SetValueCurve) legitimately keep a start time in the past once they are running,
     /// so the clamp cannot be applied per block -- doing so restarts them every quantum.
     current_block_time: f64,
+    /// Last intrinsic value published into the shared [[current value]] slot.
+    ///
+    /// Lets `compute_buffer` tell "the intrinsic moved" from "nothing happened here", so that a
+    /// quantum with no movement leaves the slot alone instead of clobbering a value the control
+    /// thread just assigned into it.
+    published_value: f32,
     buffer: ArrayVec<f32, RENDER_QUANTUM_SIZE>,
 }
 
@@ -1789,10 +1795,25 @@ impl AudioParamProcessor {
     }
 
     fn compute_buffer(&mut self, block_time: f64, dt: f64, count: usize) {
-        // Set [[current value]] to the value of paramIntrinsicValue at the
-        // beginning of this render quantum.
+        // Set [[current value]] to the value of paramIntrinsicValue at the beginning of this
+        // render quantum -- but only when the intrinsic value actually moved.
+        //
+        // The slot is shared with the control thread, which writes into it directly: setting
+        // `AudioParam::value` assigns [[current value]] first (so the getter reflects the
+        // assignment right away, as the spec requires) and only then posts the event that moves
+        // `intrinsic_value` over here. Those two steps are not atomic with respect to this thread,
+        // and the event needs a further hop to arrive. An unconditional store meant that any
+        // quantum landing in that window republished the stale intrinsic over the just-assigned
+        // value, and the control thread read the old one back -- e.g. `node.attack.value` returning
+        // the 0.003 default right after `new DynamicsCompressorNode(ctx, {attack: 0.625})`.
+        // Whichever way the two threads interleave, the intrinsic here is unchanged for as long as
+        // the event is in flight, so skipping the store in that case cannot lose an update: every
+        // real movement of the intrinsic -- incoming events, ramps, curves -- still publishes.
         let clamped = self.intrinsic_value.clamp(self.min_value, self.max_value);
-        self.current_value.store(clamped, Ordering::Release);
+        if clamped != self.published_value {
+            self.current_value.store(clamped, Ordering::Release);
+            self.published_value = clamped;
+        }
 
         // clear the buffer for this block
         self.buffer.clear();
@@ -1995,6 +2016,7 @@ pub(crate) fn audio_param_pair(
         event_timeline: AudioParamEventTimeline::new(),
         last_event: None,
         current_block_time: 0.,
+        published_value: default_value,
         buffer: ArrayVec::new(),
     };
 
@@ -2062,6 +2084,62 @@ mod tests {
         assert_float_eq!(param.min_value(), -10., abs_all <= 0.);
         assert_float_eq!(param.max_value(), 10., abs_all <= 0.);
         assert_float_eq!(param.value(), 0., abs_all <= 0.);
+    }
+
+    #[test]
+    fn test_set_value_survives_a_quantum_rendered_before_the_event_arrives() {
+        let context = OfflineAudioContext::new(1, 1, 48000.);
+
+        // Shaped after DynamicsCompressorNode.attack, where this was observed: the constructor
+        // assigns the value out of its options dictionary and the page reads it straight back.
+        let opts = AudioParamDescriptor {
+            name: String::new(),
+            automation_rate: AutomationRate::K,
+            default_value: 0.003,
+            min_value: 0.,
+            max_value: 1.,
+        };
+        let (param, mut render) = audio_param_pair(opts, context.mock_registration());
+
+        // The control thread assigns [[current value]]; the event carrying it to the render
+        // thread has not been handled yet -- that is the window this test pins down.
+        let event = param.set_value_raw(0.625);
+        assert_float_eq!(param.value(), 0.625, abs_all <= 0.);
+
+        // A quantum rendered inside that window must leave the assignment alone. It used to
+        // republish the stale intrinsic here, handing the default back to the control thread.
+        render.compute_intrinsic_values(0., 1. / 48000., RENDER_QUANTUM_SIZE);
+        assert_float_eq!(param.value(), 0.625, abs_all <= 0.);
+
+        // Once the event lands the intrinsic catches up and reports the same value.
+        render.handle_incoming_event(event);
+        render.compute_intrinsic_values(0., 1. / 48000., RENDER_QUANTUM_SIZE);
+        assert_float_eq!(param.value(), 0.625, abs_all <= 0.);
+    }
+
+    #[test]
+    fn test_intrinsic_movement_is_still_published() {
+        let context = OfflineAudioContext::new(1, 1, 48000.);
+
+        let opts = AudioParamDescriptor {
+            name: String::new(),
+            automation_rate: AutomationRate::A,
+            default_value: 0.,
+            min_value: -10.,
+            max_value: 10.,
+        };
+        let (param, mut render) = audio_param_pair(opts, context.mock_registration());
+
+        // Skipping the store when nothing moved must not make [[current value]] go stale: an
+        // automation the control thread never assigned by hand still has to be reported.
+        render.handle_incoming_event(
+            param.linear_ramp_to_value_at_time_raw(10., RENDER_QUANTUM_SIZE as f64 / 48000.),
+        );
+
+        let dt = 1. / 48000.;
+        render.compute_intrinsic_values(0., dt, RENDER_QUANTUM_SIZE);
+        render.compute_intrinsic_values(RENDER_QUANTUM_SIZE as f64 * dt, dt, RENDER_QUANTUM_SIZE);
+        assert_float_eq!(param.value(), 10., abs_all <= 1e-6);
     }
 
     #[test]
