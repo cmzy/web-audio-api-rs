@@ -441,7 +441,11 @@ impl AudioProcessor for DynamicsCompressorRenderer {
             };
 
             detector_values[i] = detector_value;
-            reduction_db = -detector_value;
+            // Subtract rather than negate: a detector sitting at +0 (anything below the
+            // threshold, silence included) would negate to -0, and `reduction` is read back as
+            // a number where that is observable -- WPT's assert_equals compares with SameValue,
+            // which separates -0 from 0. `0. - 0.` is +0.
+            reduction_db = 0. - detector_value;
             // cdB = -yL + make up gain
             // convert to lin now, so we just to multiply samples later
             reduction_gains[i] = db_to_lin(reduction_db + makeup_gain);
@@ -550,6 +554,14 @@ mod tests {
         let _ = context.start_rendering_sync();
 
         assert_float_eq!(compressor.reduction(), 0., abs <= 0.);
+        // Positive zero specifically: `assert_equals(node.reduction, 0)` in WPT compares with
+        // SameValue, which separates -0 from 0, and negating a detector sitting at +0 yields -0.
+        assert_eq!(
+            compressor.reduction().to_bits(),
+            0.0_f32.to_bits(),
+            "expected reduction to be +0, got {}",
+            compressor.reduction()
+        );
     }
 
     #[test]
