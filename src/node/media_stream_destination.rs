@@ -150,6 +150,12 @@ impl AudioProcessor for DestinationRenderer {
 
         false
     }
+
+    /// This node's output leaves the graph through its MediaStream, not through outgoing edges,
+    /// so the reclamation rule must not read "no outputs connected" as "nobody is listening".
+    fn has_side_effects(&self) -> bool {
+        true
+    }
 }
 
 struct AudioDestinationNodeStream {
