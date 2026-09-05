@@ -285,6 +285,35 @@ fn buffer_size_for_latency_category(
     }
 }
 
+/// Whether `sink_id` names an enumerable audio output device.
+///
+/// Answering an existence question by materialising the whole device list is expensive on some
+/// backends: ALSA's enumeration has to open every PCM it reports in order to read its default
+/// configuration, which on a desktop with a couple of sound cards means dozens of PCM opens
+/// (measured 575-1047 ms). `set_sink_id_sync` and `AudioContext::new` both validate their sink id
+/// this way, so that cost was being paid on every device switch - dwarfing the device switch
+/// itself. Short-circuiting on the first match removes it whenever the requested device is not at
+/// the very end of the list; the worst case is what a full enumeration always cost.
+pub(crate) fn sink_id_exists(sink_id: &str) -> BackendResult<bool> {
+    #[cfg(feature = "cubeb")]
+    {
+        Ok(cubeb::CubebBackend::enumerate_devices_sync()?
+            .into_iter()
+            .any(|d| d.kind() == crate::media_devices::MediaDeviceInfoKind::AudioOutput && d.device_id() == sink_id))
+    }
+
+    #[cfg(all(not(feature = "cubeb"), feature = "cpal"))]
+    {
+        cpal::CpalBackend::output_sink_id_exists(sink_id)
+    }
+
+    #[cfg(all(not(feature = "cubeb"), not(feature = "cpal")))]
+    {
+        let _ = sink_id;
+        Err(AudioBackendError::no_backend("sink_id_exists"))
+    }
+}
+
 pub(crate) fn enumerate_devices_sync() -> BackendResult<Vec<MediaDeviceInfo>> {
     #[cfg(feature = "cubeb")]
     {

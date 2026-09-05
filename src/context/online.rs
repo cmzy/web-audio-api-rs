@@ -10,7 +10,6 @@ use crate::context::{AudioContextState, BaseAudioContext, ConcreteBaseAudioConte
 use crate::events::EventPayload;
 use crate::events::{EventDispatch, EventHandler, EventLoop, EventType};
 use crate::io::{self, AudioBackendManager, ControlThreadInit, NoneBackend, RenderThreadInit};
-use crate::media_devices::{enumerate_devices_sync, MediaDeviceInfoKind};
 use crate::media_streams::{MediaStream, MediaStreamTrack};
 use crate::message::{ControlMessage, OneshotNotify};
 use crate::node::{self, AudioNodeOptions};
@@ -22,15 +21,16 @@ use futures_channel::oneshot;
 
 /// Check if the provided sink_id is available for playback
 ///
-/// It should be "", "none" or a valid output `sinkId` returned from [`enumerate_devices_sync`]
+/// It should be "", "none" or a valid output `sinkId` returned from [`crate::media_devices::enumerate_devices_sync`]
 fn is_valid_sink_id(sink_id: &str) -> bool {
     if sink_id.is_empty() || sink_id == "none" {
         true
     } else {
-        enumerate_devices_sync()
-            .into_iter()
-            .filter(|d| d.kind() == MediaDeviceInfoKind::AudioOutput)
-            .any(|d| d.device_id() == sink_id)
+        // Existence check, not a listing: `io::sink_id_exists` stops at the first match instead of
+        // opening every PCM the backend can name. This runs on the caller's thread at the top of
+        // `set_sink_id_sync`, where a full enumeration used to cost more than the device switch it
+        // was guarding.
+        crate::io::sink_id_exists(sink_id).unwrap_or(false)
     }
 }
 
@@ -124,7 +124,7 @@ pub struct AudioContextOptions {
     /// The audio output device
     /// - use `""` for the default audio output device
     /// - use `"none"` to process the audio graph without playing through an audio output device.
-    /// - use `"sinkId"` to use the specified audio sink id, obtained with [`enumerate_devices_sync`]
+    /// - use `"sinkId"` to use the specified audio sink id, obtained with [`crate::media_devices::enumerate_devices_sync`]
     pub sink_id: String,
 
     /// Option to request a default, optimized or specific render quantum size. It is a hint that might not be honored.

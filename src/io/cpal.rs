@@ -226,6 +226,15 @@ fn stable_device_id(
     }
 }
 
+impl CpalBackend {
+    /// Short-circuiting existence check for an output device id (see `io::sink_id_exists`).
+    /// Shares `cpal_device_for_id` with the device lookup so both walks assign the same ids.
+    pub(crate) fn output_sink_id_exists(sink_id: &str) -> BackendResult<bool> {
+        let host = get_host()?;
+        Ok(cpal_device_for_id(&host, MediaDeviceInfoKind::AudioOutput, sink_id)?.is_some())
+    }
+}
+
 /// Audio backend using the `cpal` library
 #[derive(Clone)]
 #[allow(unused)]
