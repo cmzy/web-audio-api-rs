@@ -125,6 +125,9 @@ fn cpal_device_for_id(
     let mut seen = Vec::<String>::new();
 
     for device in devices {
+        if !is_audio_endpoint(&device) {
+            continue;
+        }
         let Some(num_channels) = cpal_device_channels(&device, kind) else {
             continue;
         };
@@ -144,6 +147,44 @@ fn cpal_device_channels(device: &Device, kind: MediaDeviceInfoKind) -> Option<u1
         MediaDeviceInfoKind::AudioOutput => device.default_output_config().ok()?.channels(),
         MediaDeviceInfoKind::VideoInput => return None,
     })
+}
+
+/// PCM names that ALSA publishes through device enumeration but that are not audio
+/// endpoints.
+///
+/// ALSA's namehint list mixes real sound cards with global PCM *plugin definitions*.
+/// `null` is ALSA's `/dev/null`: it accepts every sample and discards it. Because it
+/// is backed by no hardware it also carries no clock, so it never applies
+/// back-pressure to the writer - a render thread bound to it free-runs and
+/// `AudioContext.currentTime` races ahead of wall-clock time (measured at 632x-2938x
+/// real time on Linux/ALSA). That breaks the defining property of a real-time
+/// `AudioContext`, so `null` must not be offered as an output device.
+///
+/// The list is deliberately restricted to PCMs that are provably not endpoints.
+/// Everything else ALSA reports - `default`, `pipewire`, `pulse`, and the per-card
+/// `front:`/`hw:`/`plughw:`/`sysdefault:` chains - does route audio to something and
+/// is left in place.
+const NON_ENDPOINT_PCM_IDS: &[&str] = &["null"];
+
+/// Whether a device enumerated by cpal is a real audio endpoint.
+///
+/// `DeviceDescription::driver` carries the backend's native device identifier; on ALSA
+/// that is the PCM name (`null`, `default`, `front:CARD=PCH,DEV=0`, ...). Backends that
+/// report no driver string cannot surface the ALSA pseudo-devices in the first place,
+/// so a missing driver is treated as an endpoint.
+///
+/// This predicate must be applied by every walk over the enumeration - both
+/// `enumerate_devices_sync` and `cpal_device_for_id` - because the stable device id
+/// depends on the devices seen before it. Filtering in one walk only would shift the
+/// ids handed out by the other.
+fn is_audio_endpoint(device: &Device) -> bool {
+    match device.description() {
+        Ok(description) => match description.driver() {
+            Some(driver) => !NON_ENDPOINT_PCM_IDS.contains(&driver),
+            None => true,
+        },
+        Err(_) => true,
+    }
 }
 
 fn cpal_stable_device_id(
@@ -615,6 +656,7 @@ impl AudioBackendManager for CpalBackend {
         let input_devices = host
             .input_devices()
             .map_err(|e| map_cpal_error("enumerate_input_devices", e))?
+            .filter(is_audio_endpoint)
             .filter_map(|d| {
                 let num_channels = d.default_input_config().ok()?.channels();
                 Some((d, MediaDeviceInfoKind::AudioInput, num_channels))
@@ -623,6 +665,7 @@ impl AudioBackendManager for CpalBackend {
         let output_devices = host
             .output_devices()
             .map_err(|e| map_cpal_error("enumerate_output_devices", e))?
+            .filter(is_audio_endpoint)
             .filter_map(|d| {
                 let num_channels = d.default_output_config().ok()?.channels();
                 Some((d, MediaDeviceInfoKind::AudioOutput, num_channels))
